@@ -18,6 +18,7 @@ Read `docs/architecture.md` before making architectural or multi-file changes. T
 - Ask for clarification when ambiguity would materially affect behavior or architecture.
 - Do not implement unrelated future features.
 - Do not generate the entire application at once.
+- Before using an unfamiliar or version-sensitive library API, inspect the official documentation and the installed package’s types or source. Do not rely only on remembered API details. Explain any uncertainty or discrepancy before implementing it.
 
 ## Code changes
 

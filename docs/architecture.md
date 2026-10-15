@@ -166,7 +166,8 @@ Room state is stored in the coordination server's process memory. Therefore:
 
 - Node.js
 - TypeScript
-- WebSocket-based realtime communication
+- Express for HTTP routes
+- `ws` for WebSocket-based realtime communication, attached to the same HTTP server as Express
 - In-memory room storage for V1
 
 ### Shared code
@@ -174,10 +175,10 @@ Room state is stored in the coordination server's process memory. Therefore:
 Shared TypeScript packages may contain:
 
 - Client-server protocol types.
-- Runtime message schemas.
+- Runtime message schemas (Zod).
 - Pure playback synchronization logic.
 
-Specific WebSocket, validation, testing, and server-framework libraries will be selected when their requirements become clear.
+Vitest is the test runner. Specific remaining library choices (for example WebTorrent trackers) will be selected when their requirements become clear.
 
 ## Known Limitations
 
@@ -194,8 +195,6 @@ Specific WebSocket, validation, testing, and server-framework libraries will be 
 
 The following decisions will be made during implementation and testing:
 
-- WebSocket library and server framework.
-- Runtime message-validation library.
 - Synchronization drift thresholds.
 - Whether minor drift should use temporary playback-rate adjustment.
 - Reconnection and host grace-period durations.
