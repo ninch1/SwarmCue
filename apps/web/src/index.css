@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #12141a;
+  --color-surface: #1c2029;
+  --color-panel: #2a3344;
+  --color-border: #2e3544;
+  --color-ink: #e8ebf2;
+  --color-muted: #9aa3b5;
+  --color-accent: #5b9fd4;
+  --color-danger: #e07a7a;
+  --color-input: #12151c;
+  --color-glow: #243044;
+  --font-sans: "Segoe UI", "Helvetica Neue", sans-serif;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply m-0 min-h-screen bg-canvas font-sans text-ink antialiased;
+    background-image: radial-gradient(
+      ellipse 80% 50% at 50% -20%,
+      var(--color-glow) 0%,
+      transparent 55%
+    );
+  }
+}
