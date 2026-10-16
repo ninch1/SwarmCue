@@ -13,12 +13,14 @@
   "dependencies": {
     "@swarmcue/protocol": "workspace:*",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "webtorrent": "^3.0.21"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
+    "@types/webtorrent": "^3.0.0",
     "@vitejs/plugin-react": "^5.0.4",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",

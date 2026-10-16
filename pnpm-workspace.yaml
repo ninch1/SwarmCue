@@ -1,5 +1,11 @@
 packages:
   - "apps/*"
   - "packages/*"
+# Browser WebTorrent uses the prebuilt bundle; deny Node-only native builds.
 allowBuilds:
   esbuild: true
+  bufferutil: false
+  utf-8-validate: false
+  utp-native: false
+  node-datachannel: false
+  ip-set: false
