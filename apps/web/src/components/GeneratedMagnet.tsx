@@ -43,8 +43,8 @@ export function GeneratedMagnet({
         Generated magnet
       </h2>
       <p className="m-0 text-sm text-muted">
-        Copy this link into another client. Streaming from magnets is not wired
-        yet — this step only creates and shows the magnet.
+        Copy this link into another client. Keep this tab open — it is the
+        seeder the other client streams from.
       </p>
 
       {status === "creating" ? (

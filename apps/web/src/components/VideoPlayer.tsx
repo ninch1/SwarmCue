@@ -1,8 +1,9 @@
 type VideoPlayerProps = {
   src: string | null;
+  onError?: () => void;
 };
 
-export function VideoPlayer({ src }: VideoPlayerProps) {
+export function VideoPlayer({ src, onError }: VideoPlayerProps) {
   return (
     <section
       className="grid aspect-video place-items-center overflow-hidden rounded-[10px] border border-border bg-black"
@@ -14,6 +15,7 @@ export function VideoPlayer({ src }: VideoPlayerProps) {
           src={src}
           controls
           playsInline
+          onError={onError}
           className="block h-full w-full bg-black"
         />
       ) : (

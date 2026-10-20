@@ -2,18 +2,23 @@ import { useEffect, useRef, useState } from "react";
 import { FileSelect } from "./components/FileSelect.js";
 import { GeneratedMagnet } from "./components/GeneratedMagnet.js";
 import { MagnetPaste } from "./components/MagnetPaste.js";
+import {
+  MagnetStatus,
+  type MagnetPlaybackState,
+} from "./components/MagnetStatus.js";
 import { VideoPlayer } from "./components/VideoPlayer.js";
 import { isMagnetUri } from "./media/magnet.js";
 import {
-  clearSeededTorrent,
   createMagnetFromFile,
   destroyTorrentClient,
+  playMagnet,
+  type TorrentStats,
 } from "./torrent/client.js";
 
 type MediaSource =
   | { kind: "none" }
   | { kind: "file"; fileName: string; objectUrl: string }
-  | { kind: "magnet"; magnetUri: string };
+  | { kind: "magnet"; magnetUri: string; playback: MagnetPlaybackState };
 
 type MagnetGeneration =
   | { status: "idle"; magnetUri: null; error: null }
@@ -27,12 +32,18 @@ const idleMagnetGeneration: MagnetGeneration = {
   error: null,
 };
 
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
 export function App() {
   const [source, setSource] = useState<MediaSource>({ kind: "none" });
   const [magnetError, setMagnetError] = useState<string | null>(null);
   const [magnetGeneration, setMagnetGeneration] = useState<MagnetGeneration>(
     idleMagnetGeneration,
   );
+  const [torrentStats, setTorrentStats] = useState<TorrentStats | null>(null);
+  const [playerError, setPlayerError] = useState<string | null>(null);
   const objectUrlRef = useRef<string | null>(null);
   const magnetRequestIdRef = useRef(0);
 
@@ -57,6 +68,8 @@ export function App() {
   function handleFileSelected(file: File) {
     const requestId = ++magnetRequestIdRef.current;
     setMagnetError(null);
+    setPlayerError(null);
+    setTorrentStats(null);
     clearObjectUrl();
 
     const objectUrl = URL.createObjectURL(file);
@@ -87,14 +100,10 @@ export function App() {
         if (requestId !== magnetRequestIdRef.current) {
           return;
         }
-        const message =
-          error instanceof Error
-            ? error.message
-            : "Failed to create magnet from file.";
         setMagnetGeneration({
           status: "error",
           magnetUri: null,
-          error: message,
+          error: errorMessage(error, "Failed to create magnet from file."),
         });
       });
   }
@@ -108,15 +117,52 @@ export function App() {
       return;
     }
 
-    magnetRequestIdRef.current += 1;
+    const requestId = ++magnetRequestIdRef.current;
     setMagnetError(null);
+    setPlayerError(null);
+    setTorrentStats(null);
     clearObjectUrl();
     setMagnetGeneration(idleMagnetGeneration);
-    void clearSeededTorrent();
-    setSource({ kind: "magnet", magnetUri });
+    setSource({ kind: "magnet", magnetUri, playback: { status: "loading" } });
+
+    const isCurrent = () => requestId === magnetRequestIdRef.current;
+
+    void playMagnet(magnetUri, (stats) => {
+      if (isCurrent()) {
+        setTorrentStats(stats);
+      }
+    })
+      .then((playback) => {
+        if (!isCurrent()) {
+          return;
+        }
+        setSource({
+          kind: "magnet",
+          magnetUri,
+          playback: { status: "ready", ...playback },
+        });
+      })
+      .catch((error: unknown) => {
+        if (!isCurrent()) {
+          return;
+        }
+        setSource({
+          kind: "magnet",
+          magnetUri,
+          playback: {
+            status: "error",
+            error: errorMessage(error, "Failed to load magnet."),
+          },
+        });
+      });
   }
 
-  const videoSrc = source.kind === "file" ? source.objectUrl : null;
+  let videoSrc: string | null = null;
+  if (source.kind === "file") {
+    videoSrc = source.objectUrl;
+  } else if (source.kind === "magnet" && source.playback.status === "ready") {
+    videoSrc = source.playback.streamUrl;
+  }
   const fileName = source.kind === "file" ? source.fileName : null;
   const pastedMagnetUri = source.kind === "magnet" ? source.magnetUri : null;
 
@@ -127,11 +173,29 @@ export function App() {
           SwarmCue
         </h1>
         <p className="mt-1.5 text-muted">
-          Local preview + magnet generation. WebTorrent streaming comes next.
+          Play a local file and share its magnet, or stream a magnet from
+          another client.
         </p>
       </header>
 
-      <VideoPlayer src={videoSrc} />
+      <VideoPlayer
+        src={videoSrc}
+        onError={() => {
+          setPlayerError(
+            "The browser could not play this video. Its format or codec may be unsupported.",
+          );
+        }}
+      />
+
+      {playerError ? (
+        <p className="m-0 text-sm text-danger" role="alert">
+          {playerError}
+        </p>
+      ) : null}
+
+      {source.kind === "magnet" ? (
+        <MagnetStatus playback={source.playback} stats={torrentStats} />
+      ) : null}
 
       <div className="grid gap-4 min-[720px]:grid-cols-2">
         <FileSelect
@@ -152,16 +216,6 @@ export function App() {
         status={magnetGeneration.status}
         error={magnetGeneration.error}
       />
-
-      {source.kind === "magnet" ? (
-        <p
-          className="m-0 rounded-[10px] border border-dashed border-border px-3.5 py-3 text-sm text-muted"
-          role="status"
-        >
-          Magnet captured. Playback from magnets will appear here once streaming
-          is wired.
-        </p>
-      ) : null}
     </div>
   );
 }

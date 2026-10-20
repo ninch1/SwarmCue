@@ -30,8 +30,7 @@ export function MagnetPaste({
         Magnet link
       </h2>
       <p className="m-0 text-sm text-muted">
-        Paste a magnet URI so this client can join a stream. Torrent download
-        comes next; this step only captures the link.
+        Paste a magnet URI from another client to stream it here.
       </p>
       <form className="flex flex-col gap-2" onSubmit={handleSubmit}>
         <label className="sr-only" htmlFor={inputId}>
@@ -65,7 +64,7 @@ export function MagnetPaste({
       ) : null}
       {magnetUri && !error ? (
         <p className="m-0 break-all text-sm text-accent" aria-live="polite">
-          Magnet ready (WebTorrent not wired yet): {truncateMagnet(magnetUri)}
+          Using magnet: {truncateMagnet(magnetUri)}
         </p>
       ) : null}
     </section>
