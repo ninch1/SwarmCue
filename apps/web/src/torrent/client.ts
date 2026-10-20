@@ -1,6 +1,7 @@
 import WebTorrent from "webtorrent";
 import type { Torrent } from "webtorrent";
 import { pickVideoFile } from "../media/videoFile.js";
+import { prepareTorrentStorage } from "./storage.js";
 
 /**
  * Browser peers can only use WebSocket trackers (wss://), not udp://.
@@ -154,6 +155,7 @@ function ensureStreamServer(torrentClient: WebTorrent): Promise<void> {
  */
 export async function createMagnetFromFile(file: File): Promise<string> {
   const id = ++operationId;
+  await prepareTorrentStorage();
   await removeActiveTorrent();
   if (id !== operationId) {
     throw supersededError();
@@ -168,6 +170,8 @@ export async function createMagnetFromFile(file: File): Promise<string> {
         // File.name is used as the torrent name when opts.name is omitted.
         announce: [...BROWSER_TRACKERS],
         createdBy: "SwarmCue",
+        // Seeding copies the file into browser storage; drop it on switch.
+        destroyStoreOnDestroy: true,
       },
       (seeded) => {
         resolve(seeded.magnetURI);
@@ -190,6 +194,7 @@ export async function playMagnet(
   onStats: (stats: TorrentStats) => void,
 ): Promise<MagnetPlayback> {
   const id = ++operationId;
+  await prepareTorrentStorage();
   await removeActiveTorrent();
   const torrentClient = getClient();
   await ensureStreamServer(torrentClient);
@@ -200,8 +205,12 @@ export async function playMagnet(
   return new Promise((resolve, reject) => {
     const torrent = torrentClient.add(
       magnetUri,
-      // Adds browser trackers in case the pasted magnet only lists udp:// ones.
-      { announce: [...BROWSER_TRACKERS] },
+      {
+        // Adds browser trackers in case the pasted magnet only lists udp:// ones.
+        announce: [...BROWSER_TRACKERS],
+        // Downloaded pieces are not kept once the user switches media.
+        destroyStoreOnDestroy: true,
+      },
       (ready) => {
         const file = pickVideoFile(ready.files);
         if (!file) {
