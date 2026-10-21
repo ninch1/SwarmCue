@@ -1,15 +1,155 @@
-import type { WebSocketServer } from "ws";
+import {
+  parseClientMessage,
+  type ErrorCode,
+  type ParticipantId,
+  type RoomId,
+  type RoomSnapshot,
+  type ServerMessage,
+} from "@swarmcue/protocol";
+import { WebSocket, type RawData, type WebSocketServer } from "ws";
+import type { RoomStore } from "../rooms/index.js";
+
+type Session = {
+  roomId: RoomId;
+  participantId: ParticipantId;
+};
+
+const ERROR_TEXT: Record<"room_not_found" | "room_full", string> = {
+  room_not_found: "No room exists with that code.",
+  room_full: "That room is full.",
+};
+
+function rawDataToString(data: RawData): string {
+  if (Array.isArray(data)) {
+    return Buffer.concat(data).toString("utf8");
+  }
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(data).toString("utf8");
+  }
+  return data.toString("utf8");
+}
 
 /**
- * Attaches WebSocket handling. Room join/create logic is added in Milestone 1.
+ * Translates WebSocket traffic into room-domain operations. Messages larger
+ * than the server's `maxPayload` are rejected by `ws` itself, which closes
+ * the connection.
  */
-export function attachRealtime(wss: WebSocketServer): void {
+export function attachRealtime(wss: WebSocketServer, rooms: RoomStore): void {
+  const socketsByRoom = new Map<RoomId, Set<WebSocket>>();
+
+  function send(socket: WebSocket, message: ServerMessage): void {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(message));
+    }
+  }
+
+  function sendError(socket: WebSocket, code: ErrorCode, message: string): void {
+    send(socket, { type: "error", code, message });
+  }
+
+  function broadcastSnapshot(snapshot: RoomSnapshot, except?: WebSocket): void {
+    const sockets = socketsByRoom.get(snapshot.roomId);
+    if (!sockets) {
+      return;
+    }
+    for (const socket of sockets) {
+      if (socket !== except) {
+        send(socket, { type: "room.snapshot", snapshot });
+      }
+    }
+  }
+
   wss.on("connection", (socket) => {
-    socket.send(
-      JSON.stringify({
-        type: "connected",
-        message: "SwarmCue realtime ready",
-      }),
-    );
+    let session: Session | null = null;
+
+    function enterRoom(snapshot: RoomSnapshot, participantId: ParticipantId): void {
+      session = { roomId: snapshot.roomId, participantId };
+
+      let sockets = socketsByRoom.get(snapshot.roomId);
+      if (!sockets) {
+        sockets = new Set();
+        socketsByRoom.set(snapshot.roomId, sockets);
+      }
+      sockets.add(socket);
+
+      send(socket, { type: "room.joined", selfId: participantId, snapshot });
+      broadcastSnapshot(snapshot, socket);
+    }
+
+    function handleMessage(data: RawData, isBinary: boolean): void {
+      if (isBinary) {
+        sendError(socket, "invalid_message", "Binary messages are not supported.");
+        return;
+      }
+
+      let raw: unknown;
+      try {
+        raw = JSON.parse(rawDataToString(data));
+      } catch {
+        sendError(socket, "invalid_message", "Message is not valid JSON.");
+        return;
+      }
+
+      const parsed = parseClientMessage(raw);
+      if (!parsed.ok) {
+        sendError(socket, parsed.code, parsed.message);
+        return;
+      }
+
+      if (session) {
+        sendError(socket, "already_in_room", "This connection is already in a room.");
+        return;
+      }
+
+      const message = parsed.message;
+      switch (message.type) {
+        case "room.create": {
+          const { participant, snapshot } = rooms.createRoom(message.displayName);
+          enterRoom(snapshot, participant.id);
+          return;
+        }
+        case "room.join": {
+          const result = rooms.joinRoom(message.roomId, message.displayName);
+          if (!result.ok) {
+            sendError(socket, result.error, ERROR_TEXT[result.error]);
+            return;
+          }
+          enterRoom(result.snapshot, result.participant.id);
+          return;
+        }
+      }
+    }
+
+    socket.on("message", (data, isBinary) => {
+      try {
+        handleMessage(data, isBinary);
+      } catch (error) {
+        console.error("Failed to handle client message:", error);
+        sendError(socket, "internal_error", "The server could not handle that message.");
+      }
+    });
+
+    socket.on("close", () => {
+      if (!session) {
+        return;
+      }
+      const { roomId, participantId } = session;
+      session = null;
+
+      const sockets = socketsByRoom.get(roomId);
+      sockets?.delete(socket);
+      if (sockets?.size === 0) {
+        socketsByRoom.delete(roomId);
+      }
+
+      const snapshot = rooms.leaveRoom(roomId, participantId);
+      if (snapshot) {
+        broadcastSnapshot(snapshot);
+      }
+    });
+
+    socket.on("error", (error) => {
+      console.error("WebSocket error:", error);
+    });
   });
 }

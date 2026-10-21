@@ -6,8 +6,10 @@ import {
   MagnetStatus,
   type MagnetPlaybackState,
 } from "./components/MagnetStatus.js";
+import { RoomPanel } from "./components/RoomPanel.js";
 import { VideoPlayer } from "./components/VideoPlayer.js";
 import { isMagnetUri } from "./media/magnet.js";
+import { useRoom } from "./room/useRoom.js";
 import {
   createMagnetFromFile,
   destroyTorrentClient,
@@ -37,6 +39,7 @@ function errorMessage(error: unknown, fallback: string): string {
 }
 
 export function App() {
+  const room = useRoom();
   const [source, setSource] = useState<MediaSource>({ kind: "none" });
   const [magnetError, setMagnetError] = useState<string | null>(null);
   const [magnetGeneration, setMagnetGeneration] = useState<MagnetGeneration>(
@@ -177,6 +180,8 @@ export function App() {
           another client.
         </p>
       </header>
+
+      <RoomPanel room={room} />
 
       <VideoPlayer
         src={videoSrc}
