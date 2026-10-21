@@ -9,6 +9,10 @@ export type ProtocolVersion = typeof ProtocolVersion;
 export const ROOM_ID_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 export const ROOM_ID_LENGTH = 8;
 export const DISPLAY_NAME_MAX_LENGTH = 32;
+export const MAGNET_URI_MAX_LENGTH = 2048;
+export const MEDIA_NAME_MAX_LENGTH = 255;
+
+const NO_CONTROL_CHARACTERS = /^\P{Cc}+$/u;
 
 export const RoomIdSchema = z
   .string()
@@ -25,7 +29,7 @@ export const DisplayNameSchema = z
     DISPLAY_NAME_MAX_LENGTH,
     `Display names can be at most ${DISPLAY_NAME_MAX_LENGTH} characters.`,
   )
-  .regex(/^\P{Cc}+$/u, "Display names cannot contain control characters.");
+  .regex(NO_CONTROL_CHARACTERS, "Display names cannot contain control characters.");
 
 export const ParticipantIdSchema = z.string().min(1).max(64);
 
@@ -34,11 +38,44 @@ export const ParticipantSchema = z.strictObject({
   displayName: DisplayNameSchema,
 });
 
-/** Complete description of a room at one moment. Participants are in join order. */
-export const RoomSnapshotSchema = z.strictObject({
-  roomId: RoomIdSchema,
-  participants: z.array(ParticipantSchema),
+/**
+ * BitTorrent v1 magnet: the info hash is 40 hex or 32 base32 characters.
+ * A regex rather than URLSearchParams keeps this package free of DOM/Node globals.
+ */
+export const MagnetUriSchema = z
+  .string()
+  .max(MAGNET_URI_MAX_LENGTH, "Magnet link is too long.")
+  .regex(
+    /^magnet:\?(?:.*&)?xt=urn:btih:(?:[0-9a-f]{40}|[a-z2-7]{32})(?:&|$)/i,
+    "Enter a valid magnet link (must include xt=urn:btih:…).",
+  );
+
+/** What the host shares with the room. Name and size are unknown for some magnets. */
+export const SharedMediaSchema = z.strictObject({
+  magnetUri: MagnetUriSchema,
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MEDIA_NAME_MAX_LENGTH)
+    .regex(NO_CONTROL_CHARACTERS, "Media names cannot contain control characters.")
+    .nullable(),
+  sizeBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
 });
+
+/** Complete description of a room at one moment. Participants are in join order. */
+export const RoomSnapshotSchema = z
+  .strictObject({
+    roomId: RoomIdSchema,
+    hostId: ParticipantIdSchema,
+    participants: z.array(ParticipantSchema),
+    media: SharedMediaSchema.nullable(),
+  })
+  .refine(
+    (snapshot) =>
+      snapshot.participants.some((participant) => participant.id === snapshot.hostId),
+    { message: "The host must be one of the participants.", path: ["hostId"] },
+  );
 
 // Client → server
 
@@ -55,9 +92,17 @@ export const RoomJoinMessageSchema = z.strictObject({
   displayName: DisplayNameSchema,
 });
 
+/** Host only: replace the room's shared media. */
+export const MediaSetMessageSchema = z.strictObject({
+  type: z.literal("media.set"),
+  protocolVersion: z.literal(ProtocolVersion),
+  media: SharedMediaSchema,
+});
+
 export const ClientMessageSchema = z.discriminatedUnion("type", [
   RoomCreateMessageSchema,
   RoomJoinMessageSchema,
+  MediaSetMessageSchema,
 ]);
 
 // Server → client
@@ -68,6 +113,8 @@ export const ErrorCodeSchema = z.enum([
   "room_not_found",
   "room_full",
   "already_in_room",
+  "not_in_room",
+  "not_host",
   "internal_error",
 ]);
 
@@ -78,7 +125,7 @@ export const RoomJoinedMessageSchema = z.strictObject({
   snapshot: RoomSnapshotSchema,
 });
 
-/** Sent to the other participants whenever room membership changes. */
+/** Sent whenever room membership, host, or shared media changes. */
 export const RoomSnapshotMessageSchema = z.strictObject({
   type: z.literal("room.snapshot"),
   snapshot: RoomSnapshotSchema,
@@ -99,6 +146,7 @@ export const ServerMessageSchema = z.discriminatedUnion("type", [
 export type RoomId = z.infer<typeof RoomIdSchema>;
 export type ParticipantId = z.infer<typeof ParticipantIdSchema>;
 export type Participant = z.infer<typeof ParticipantSchema>;
+export type SharedMedia = z.infer<typeof SharedMediaSchema>;
 export type RoomSnapshot = z.infer<typeof RoomSnapshotSchema>;
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;

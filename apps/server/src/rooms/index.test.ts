@@ -27,7 +27,7 @@ function createTestStore(options: {
 }
 
 describe("createRoomStore", () => {
-  it("creates a room containing only the creator", () => {
+  it("creates a room containing only the creator, who is host", () => {
     const store = createTestStore();
 
     const { participant, snapshot } = store.createRoom("Ada");
@@ -35,11 +35,13 @@ describe("createRoomStore", () => {
     expect(participant).toEqual({ id: "p1", displayName: "Ada" });
     expect(snapshot).toEqual({
       roomId: "AAAAAAAA",
+      hostId: "p1",
       participants: [{ id: "p1", displayName: "Ada" }],
+      media: null,
     });
   });
 
-  it("gives joiners the same snapshot in join order", () => {
+  it("gives joiners the same snapshot in join order without making them host", () => {
     const store = createTestStore();
     const created = store.createRoom("Ada");
 
@@ -50,10 +52,12 @@ describe("createRoomStore", () => {
       participant: { id: "p2", displayName: "Grace" },
       snapshot: {
         roomId: "AAAAAAAA",
+        hostId: "p1",
         participants: [
           { id: "p1", displayName: "Ada" },
           { id: "p2", displayName: "Grace" },
         ],
+        media: null,
       },
     });
     expect(store.getSnapshot("AAAAAAAA")).toEqual(
@@ -82,14 +86,33 @@ describe("createRoomStore", () => {
     expect(store.getSnapshot(snapshot.roomId)?.participants).toHaveLength(2);
   });
 
-  it("removes a leaving participant and keeps the others", () => {
+  it("keeps the host when a non-host participant leaves", () => {
     const store = createTestStore();
     const { snapshot } = store.createRoom("Ada");
     store.joinRoom(snapshot.roomId, "Grace");
 
+    expect(store.leaveRoom(snapshot.roomId, "p2")).toEqual({
+      roomId: "AAAAAAAA",
+      hostId: "p1",
+      participants: [{ id: "p1", displayName: "Ada" }],
+      media: null,
+    });
+  });
+
+  it("promotes the earliest-joined remaining participant when the host leaves", () => {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada");
+    store.joinRoom(snapshot.roomId, "Grace");
+    store.joinRoom(snapshot.roomId, "Linus");
+
     expect(store.leaveRoom(snapshot.roomId, "p1")).toEqual({
       roomId: "AAAAAAAA",
-      participants: [{ id: "p2", displayName: "Grace" }],
+      hostId: "p2",
+      participants: [
+        { id: "p2", displayName: "Grace" },
+        { id: "p3", displayName: "Linus" },
+      ],
+      media: null,
     });
   });
 
@@ -121,6 +144,85 @@ describe("createRoomStore", () => {
     snapshot.participants.push({ id: "intruder", displayName: "Eve" });
 
     expect(store.getSnapshot(snapshot.roomId)?.participants).toHaveLength(1);
+  });
+});
+
+describe("setMedia", () => {
+  const media = {
+    magnetUri: "magnet:?xt=urn:btih:c9e15763f722f23e98a29decdfae341b98d53056",
+    name: "movie.mp4",
+    sizeBytes: 1024,
+  };
+
+  it("lets the host set media and returns the updated snapshot", () => {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada");
+    store.joinRoom(snapshot.roomId, "Grace");
+
+    const result = store.setMedia(snapshot.roomId, "p1", media);
+
+    expect(result).toEqual({
+      ok: true,
+      snapshot: {
+        roomId: "AAAAAAAA",
+        hostId: "p1",
+        participants: [
+          { id: "p1", displayName: "Ada" },
+          { id: "p2", displayName: "Grace" },
+        ],
+        media,
+      },
+    });
+    expect(store.getSnapshot(snapshot.roomId)?.media).toEqual(media);
+  });
+
+  it("rejects a non-host and leaves the state unchanged", () => {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada");
+    store.joinRoom(snapshot.roomId, "Grace");
+
+    expect(store.setMedia(snapshot.roomId, "p2", media)).toEqual({
+      ok: false,
+      error: "not_host",
+    });
+    expect(store.getSnapshot(snapshot.roomId)?.media).toBeNull();
+  });
+
+  it("rejects an unknown room", () => {
+    const store = createTestStore();
+
+    expect(store.setMedia("ZZZZZZZZ", "p1", media)).toEqual({
+      ok: false,
+      error: "room_not_found",
+    });
+  });
+
+  it("keeps the media when the host leaves and lets the new host replace it", () => {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada");
+    store.joinRoom(snapshot.roomId, "Grace");
+    store.setMedia(snapshot.roomId, "p1", media);
+
+    const afterLeave = store.leaveRoom(snapshot.roomId, "p1");
+    expect(afterLeave?.media).toEqual(media);
+
+    const replacement = { ...media, name: "other.mp4" };
+    expect(store.setMedia(snapshot.roomId, "p2", replacement).ok).toBe(true);
+    expect(store.getSnapshot(snapshot.roomId)?.media).toEqual(replacement);
+  });
+
+  it("does not expose stored media through snapshots or the caller's object", () => {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada");
+    const input = { ...media };
+
+    const result = store.setMedia(snapshot.roomId, "p1", input);
+    input.name = "changed-by-caller";
+    if (result.ok && result.snapshot.media) {
+      result.snapshot.media.name = "changed-by-receiver";
+    }
+
+    expect(store.getSnapshot(snapshot.roomId)?.media).toEqual(media);
   });
 });
 

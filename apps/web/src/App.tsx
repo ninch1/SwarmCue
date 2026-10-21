@@ -8,7 +8,7 @@ import {
 } from "./components/MagnetStatus.js";
 import { RoomPanel } from "./components/RoomPanel.js";
 import { VideoPlayer } from "./components/VideoPlayer.js";
-import { isMagnetUri } from "./media/magnet.js";
+import { isMagnetUri, magnetMetadata, toMediaName } from "./media/magnet.js";
 import { useRoom } from "./room/useRoom.js";
 import {
   createMagnetFromFile,
@@ -47,8 +47,20 @@ export function App() {
   );
   const [torrentStats, setTorrentStats] = useState<TorrentStats | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
+  const [shareError, setShareError] = useState<string | null>(null);
   const objectUrlRef = useRef<string | null>(null);
   const magnetRequestIdRef = useRef(0);
+  /** Last magnet this client started loading; guards the viewer auto-load effect. */
+  const loadedMagnetRef = useRef<string | null>(null);
+
+  const inRoom = room.state.status === "in-room";
+  const isHost =
+    room.state.status === "in-room" &&
+    room.state.selfId === room.state.snapshot.hostId;
+  const sharedMagnetUri =
+    room.state.status === "in-room"
+      ? (room.state.snapshot.media?.magnetUri ?? null)
+      : null;
 
   useEffect(() => {
     return () => {
@@ -61,6 +73,19 @@ export function App() {
     };
   }, []);
 
+  // Viewers load whatever the host shares. The <video> gets a source but no
+  // autoPlay, so playback never starts on its own. The host keeps its own
+  // local playback and never loads the magnet it shared.
+  useEffect(() => {
+    if (!inRoom || isHost || !sharedMagnetUri) {
+      return;
+    }
+    if (loadedMagnetRef.current === sharedMagnetUri) {
+      return;
+    }
+    loadMagnet(sharedMagnetUri);
+  }, [inRoom, isHost, sharedMagnetUri]);
+
   function clearObjectUrl() {
     if (objectUrlRef.current) {
       URL.revokeObjectURL(objectUrlRef.current);
@@ -70,8 +95,10 @@ export function App() {
 
   function handleFileSelected(file: File) {
     const requestId = ++magnetRequestIdRef.current;
+    loadedMagnetRef.current = null;
     setMagnetError(null);
     setPlayerError(null);
+    setShareError(null);
     setTorrentStats(null);
     clearObjectUrl();
 
@@ -98,6 +125,13 @@ export function App() {
           magnetUri,
           error: null,
         });
+        setShareError(
+          room.setMedia({
+            magnetUri,
+            name: toMediaName(file.name),
+            sizeBytes: file.size,
+          }),
+        );
       })
       .catch((error: unknown) => {
         if (requestId !== magnetRequestIdRef.current) {
@@ -111,6 +145,7 @@ export function App() {
       });
   }
 
+  /** Host: paste a magnet, play it locally, and share it with the room. */
   function handleMagnetSubmit(rawMagnet: string) {
     const magnetUri = rawMagnet.trim();
     if (!isMagnetUri(magnetUri)) {
@@ -120,8 +155,16 @@ export function App() {
       return;
     }
 
+    loadMagnet(magnetUri);
+    setShareError(room.setMedia({ magnetUri, ...magnetMetadata(magnetUri) }));
+  }
+
+  /** Stream a magnet into the local player. Used by the host's paste and by viewers. */
+  function loadMagnet(magnetUri: string) {
     const requestId = ++magnetRequestIdRef.current;
+    loadedMagnetRef.current = magnetUri;
     setMagnetError(null);
+    setShareError(null);
     setPlayerError(null);
     setTorrentStats(null);
     clearObjectUrl();
@@ -169,6 +212,15 @@ export function App() {
   const fileName = source.kind === "file" ? source.fileName : null;
   const pastedMagnetUri = source.kind === "magnet" ? source.magnetUri : null;
 
+  let emptyPlayerMessage = "Create or join a room to watch together.";
+  if (isHost) {
+    emptyPlayerMessage = "Choose a local video file or paste a magnet link.";
+  } else if (inRoom) {
+    emptyPlayerMessage = sharedMagnetUri
+      ? "Loading the host's media…"
+      : "Waiting for the host to share media.";
+  }
+
   return (
     <div className="mx-auto flex max-w-[960px] flex-col gap-5 px-5 py-6 pb-10">
       <header>
@@ -176,8 +228,8 @@ export function App() {
           SwarmCue
         </h1>
         <p className="mt-1.5 text-muted">
-          Play a local file and share its magnet, or stream a magnet from
-          another client.
+          Create or join a room. The host shares a video, and everyone else
+          streams it from the host.
         </p>
       </header>
 
@@ -185,6 +237,7 @@ export function App() {
 
       <VideoPlayer
         src={videoSrc}
+        emptyMessage={emptyPlayerMessage}
         onError={() => {
           setPlayerError(
             "The browser could not play this video. Its format or codec may be unsupported.",
@@ -202,25 +255,35 @@ export function App() {
         <MagnetStatus playback={source.playback} stats={torrentStats} />
       ) : null}
 
-      <div className="grid gap-4 min-[720px]:grid-cols-2">
-        <FileSelect
-          fileName={fileName}
-          onFileSelected={handleFileSelected}
-          disabled={magnetGeneration.status === "creating"}
-        />
-        <MagnetPaste
-          magnetUri={pastedMagnetUri}
-          error={magnetError}
-          onMagnetSubmit={handleMagnetSubmit}
-          disabled={magnetGeneration.status === "creating"}
-        />
-      </div>
+      {isHost ? (
+        <>
+          <div className="grid gap-4 min-[720px]:grid-cols-2">
+            <FileSelect
+              fileName={fileName}
+              onFileSelected={handleFileSelected}
+              disabled={magnetGeneration.status === "creating"}
+            />
+            <MagnetPaste
+              magnetUri={pastedMagnetUri}
+              error={magnetError}
+              onMagnetSubmit={handleMagnetSubmit}
+              disabled={magnetGeneration.status === "creating"}
+            />
+          </div>
 
-      <GeneratedMagnet
-        magnetUri={magnetGeneration.magnetUri}
-        status={magnetGeneration.status}
-        error={magnetGeneration.error}
-      />
+          {shareError ? (
+            <p className="m-0 text-sm text-danger" role="alert">
+              Could not share with the room: {shareError}
+            </p>
+          ) : null}
+
+          <GeneratedMagnet
+            magnetUri={magnetGeneration.magnetUri}
+            status={magnetGeneration.status}
+            error={magnetGeneration.error}
+          />
+        </>
+      ) : null}
     </div>
   );
 }

@@ -6,6 +6,12 @@ import {
 } from "./index.js";
 
 const validRoomId = "K7QM3XPD";
+const hexHash = "c9e15763f722f23e98a29decdfae341b98d53056";
+const validMagnet = `magnet:?xt=urn:btih:${hexHash}&dn=movie.mp4`;
+
+function mediaSet(media: unknown) {
+  return { type: "media.set", protocolVersion: ProtocolVersion, media };
+}
 
 describe("parseClientMessage", () => {
   it("accepts room.create and trims the display name", () => {
@@ -107,6 +113,54 @@ describe("parseClientMessage", () => {
   });
 });
 
+describe("media.set", () => {
+  it.each([
+    ["file metadata", { magnetUri: validMagnet, name: "movie.mp4", sizeBytes: 1024 }],
+    ["unknown metadata", { magnetUri: validMagnet, name: null, sizeBytes: null }],
+    [
+      "base32 info hash",
+      {
+        magnetUri: "magnet:?dn=x&xt=urn:btih:ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
+        name: null,
+        sizeBytes: null,
+      },
+    ],
+  ])("accepts %s", (_label, media) => {
+    expect(parseClientMessage(mediaSet(media)).ok).toBe(true);
+  });
+
+  it.each([
+    ["non-magnet uri", { magnetUri: "https://example.com", name: null, sizeBytes: null }],
+    [
+      "short info hash",
+      { magnetUri: "magnet:?xt=urn:btih:abc", name: null, sizeBytes: null },
+    ],
+    [
+      "too-long magnet",
+      {
+        magnetUri: `${validMagnet}&tr=${"x".repeat(2048)}`,
+        name: null,
+        sizeBytes: null,
+      },
+    ],
+    ["negative size", { magnetUri: validMagnet, name: null, sizeBytes: -1 }],
+    ["fractional size", { magnetUri: validMagnet, name: null, sizeBytes: 1.5 }],
+    ["blank name", { magnetUri: validMagnet, name: "  ", sizeBytes: null }],
+    ["control characters in name", { magnetUri: validMagnet, name: "a\nb", sizeBytes: null }],
+    ["missing fields", { magnetUri: validMagnet }],
+    [
+      "extra keys",
+      { magnetUri: validMagnet, name: null, sizeBytes: null, hostId: "p1" },
+    ],
+  ])("rejects %s", (_label, media) => {
+    const result = parseClientMessage(mediaSet(media));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("invalid_message");
+    }
+  });
+});
+
 describe("ServerMessageSchema", () => {
   it("accepts a room.joined message", () => {
     const result = ServerMessageSchema.safeParse({
@@ -114,11 +168,27 @@ describe("ServerMessageSchema", () => {
       selfId: "p1",
       snapshot: {
         roomId: validRoomId,
+        hostId: "p1",
         participants: [{ id: "p1", displayName: "Ada" }],
+        media: { magnetUri: validMagnet, name: "movie.mp4", sizeBytes: 1024 },
       },
     });
 
     expect(result.success).toBe(true);
+  });
+
+  it("rejects a snapshot whose host is not a participant", () => {
+    const result = ServerMessageSchema.safeParse({
+      type: "room.snapshot",
+      snapshot: {
+        roomId: validRoomId,
+        hostId: "p2",
+        participants: [{ id: "p1", displayName: "Ada" }],
+        media: null,
+      },
+    });
+
+    expect(result.success).toBe(false);
   });
 
   it("rejects an unknown error code", () => {

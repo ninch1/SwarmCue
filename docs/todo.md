@@ -1,5 +1,10 @@
 # SwarmCue TODO
 
+## Next
+
+- [ ] Fix magnets for torrents that contain other files besides the video (subtitles, posters, samples). Viewers get `MEDIA_ELEMENT_ERROR: Format error` (seen with the Cosmos Laundromat demo torrent). Already ruled out in WebTorrent 3.0.21: `pickVideoFile` picks the right file, the stream URL matches nested paths (`lib/server.js`), and the response sets the correct type and supports range requests. Remaining suspects: the browser chunk store (`fsa-chunk-store`) reading pieces that cross file boundaries, and every file in the torrent being downloaded. First step: reproduce in one tab of a clean browser profile with DevTools open, and check the `/webtorrent/...` network request to see whether the response failed or returned bad bytes. Downloading only the chosen video (`file.select()` / `file.deselect()`) is worth doing regardless, since it saves bandwidth.
+- [ ] Remove the "Generated magnet" panel (`apps/web/src/components/GeneratedMagnet.tsx`); magnets are now shared with the room automatically. Keep a small status line for the host, because that panel currently also shows "Creating torrent and magnet…" and seeding errors.
+
 ## Reminders
 
 - [ ] Add rate limiting for client WebSocket messages (architecture: reject excessive client messages). The rooms milestone only enforces a 4 KB `maxPayload` and schema validation.

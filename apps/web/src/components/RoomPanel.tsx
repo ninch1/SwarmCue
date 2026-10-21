@@ -1,3 +1,4 @@
+import type { Participant, SharedMedia } from "@swarmcue/protocol";
 import { useId, useState, type FormEvent } from "react";
 import { formatRoomCode } from "../room/roomCode.js";
 import type { UseRoom } from "../room/useRoom.js";
@@ -21,7 +22,10 @@ export function RoomPanel({ room }: RoomPanelProps) {
       <InRoom
         roomId={state.snapshot.roomId}
         selfId={state.selfId}
+        hostId={state.snapshot.hostId}
         participants={state.snapshot.participants}
+        media={state.snapshot.media}
+        error={state.error}
         onLeave={room.leaveRoom}
       />
     );
@@ -128,11 +132,33 @@ function RoomEntry({ connecting, error, onCreate, onJoin }: RoomEntryProps) {
 type InRoomProps = {
   roomId: string;
   selfId: string;
-  participants: { id: string; displayName: string }[];
+  hostId: string;
+  participants: Participant[];
+  media: SharedMedia | null;
+  error: string | null;
   onLeave: () => void;
 };
 
-function InRoom({ roomId, selfId, participants, onLeave }: InRoomProps) {
+function formatBytes(bytes: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${value} B` : `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function InRoom({
+  roomId,
+  selfId,
+  hostId,
+  participants,
+  media,
+  error,
+  onLeave,
+}: InRoomProps) {
   const id = useId();
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
     "idle",
@@ -188,12 +214,33 @@ function InRoom({ roomId, selfId, participants, onLeave }: InRoomProps) {
         {participants.map((participant) => (
           <li key={participant.id} className="text-sm">
             {participant.displayName}
+            {participant.id === hostId ? (
+              <span className="text-accent"> (host)</span>
+            ) : null}
             {participant.id === selfId ? (
               <span className="text-muted"> (you)</span>
             ) : null}
           </li>
         ))}
       </ul>
+
+      <p className="m-0 text-sm text-muted">
+        Shared media:{" "}
+        {media ? (
+          <>
+            <span className="text-ink">{media.name ?? "Untitled media"}</span>
+            {media.sizeBytes !== null ? ` (${formatBytes(media.sizeBytes)})` : null}
+          </>
+        ) : (
+          "none yet"
+        )}
+      </p>
+
+      {error ? (
+        <p className="m-0 text-sm text-danger" role="alert">
+          {error}
+        </p>
+      ) : null}
     </section>
   );
 }

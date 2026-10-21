@@ -104,6 +104,12 @@ When a participant joins or reconnects, the server sends a complete room snapsho
 
 A snapshot simply means a complete description of the room at that moment.
 
+### Host role (interim)
+
+The participant who creates a room is its host. Only the host may change the shared media; the server checks this against the sender's server-side session, not against anything the client claims.
+
+Until reconnection grace periods are designed, host ownership transfers immediately: when the host disconnects, the earliest-joined remaining participant becomes host. The shared media is kept, which may leave it without a seeder (see Known Limitations).
+
 ## Playback Synchronization Model
 
 The coordination server maintains an authoritative playback state containing conceptually:

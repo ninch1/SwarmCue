@@ -1,9 +1,11 @@
 type VideoPlayerProps = {
   src: string | null;
+  /** Shown under "No media loaded" when there is no source. */
+  emptyMessage: string;
   onError?: () => void;
 };
 
-export function VideoPlayer({ src, onError }: VideoPlayerProps) {
+export function VideoPlayer({ src, emptyMessage, onError }: VideoPlayerProps) {
   return (
     <section
       className="grid aspect-video place-items-center overflow-hidden rounded-[10px] border border-border bg-black"
@@ -21,9 +23,7 @@ export function VideoPlayer({ src, onError }: VideoPlayerProps) {
       ) : (
         <div className="px-6 py-6 text-center text-muted">
           <p className="m-0">No media loaded</p>
-          <p className="m-0 mt-1.5 text-sm">
-            Choose a local video file or paste a magnet link.
-          </p>
+          <p className="m-0 mt-1.5 text-sm">{emptyMessage}</p>
         </div>
       )}
     </section>

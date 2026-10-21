@@ -6,6 +6,7 @@ import type {
   ParticipantId,
   RoomId,
   RoomSnapshot,
+  SharedMedia,
 } from "@swarmcue/protocol";
 
 export type RoomStoreOptions = {
@@ -25,10 +26,18 @@ export type JoinRoomResult =
   | ({ ok: true } & EnteredRoom)
   | { ok: false; error: JoinRoomError };
 
+export type SetMediaError = "room_not_found" | "not_host";
+
+export type SetMediaResult =
+  | { ok: true; snapshot: RoomSnapshot }
+  | { ok: false; error: SetMediaError };
+
 type Room = {
   id: RoomId;
+  hostId: ParticipantId;
   /** Join order. */
   participants: Participant[];
+  media: SharedMedia | null;
 };
 
 const MAX_ROOM_ID_ATTEMPTS = 10;
@@ -39,7 +48,9 @@ export function createRoomStore(options: RoomStoreOptions) {
   function toSnapshot(room: Room): RoomSnapshot {
     return {
       roomId: room.id,
+      hostId: room.hostId,
       participants: room.participants.map((participant) => ({ ...participant })),
+      media: room.media ? { ...room.media } : null,
     };
   }
 
@@ -53,20 +64,20 @@ export function createRoomStore(options: RoomStoreOptions) {
     throw new Error("Failed to generate a unique room id.");
   }
 
-  function addParticipant(room: Room, displayName: string): Participant {
-    const participant: Participant = {
-      id: options.generateParticipantId(),
-      displayName,
-    };
-    room.participants.push(participant);
-    return participant;
+  function newParticipant(displayName: string): Participant {
+    return { id: options.generateParticipantId(), displayName };
   }
 
   return {
     createRoom(displayName: string): EnteredRoom {
-      const room: Room = { id: generateUniqueRoomId(), participants: [] };
+      const participant = newParticipant(displayName);
+      const room: Room = {
+        id: generateUniqueRoomId(),
+        hostId: participant.id,
+        participants: [participant],
+        media: null,
+      };
       rooms.set(room.id, room);
-      const participant = addParticipant(room, displayName);
       return { participant: { ...participant }, snapshot: toSnapshot(room) };
     },
 
@@ -78,7 +89,8 @@ export function createRoomStore(options: RoomStoreOptions) {
       if (room.participants.length >= options.maxParticipants) {
         return { ok: false, error: "room_full" };
       }
-      const participant = addParticipant(room, displayName);
+      const participant = newParticipant(displayName);
+      room.participants.push(participant);
       return {
         ok: true,
         participant: { ...participant },
@@ -87,8 +99,10 @@ export function createRoomStore(options: RoomStoreOptions) {
     },
 
     /**
-     * Remove a participant. Returns the updated snapshot, or null when the
-     * room no longer exists (unknown, or deleted because it became empty).
+     * Remove a participant. If the host leaves, the earliest-joined remaining
+     * participant becomes host immediately. Returns the updated snapshot, or
+     * null when the room no longer exists (unknown, or deleted because it
+     * became empty).
      */
     leaveRoom(roomId: RoomId, participantId: ParticipantId): RoomSnapshot | null {
       const room = rooms.get(roomId);
@@ -98,11 +112,32 @@ export function createRoomStore(options: RoomStoreOptions) {
       room.participants = room.participants.filter(
         (participant) => participant.id !== participantId,
       );
-      if (room.participants.length === 0) {
+      const nextHost = room.participants[0];
+      if (!nextHost) {
         rooms.delete(roomId);
         return null;
       }
+      if (room.hostId === participantId) {
+        room.hostId = nextHost.id;
+      }
       return toSnapshot(room);
+    },
+
+    /** Replace the shared media. Only the current host may do this. */
+    setMedia(
+      roomId: RoomId,
+      participantId: ParticipantId,
+      media: SharedMedia,
+    ): SetMediaResult {
+      const room = rooms.get(roomId);
+      if (!room) {
+        return { ok: false, error: "room_not_found" };
+      }
+      if (room.hostId !== participantId) {
+        return { ok: false, error: "not_host" };
+      }
+      room.media = { ...media };
+      return { ok: true, snapshot: toSnapshot(room) };
     },
 
     getSnapshot(roomId: RoomId): RoomSnapshot | null {

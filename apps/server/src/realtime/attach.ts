@@ -14,9 +14,10 @@ type Session = {
   participantId: ParticipantId;
 };
 
-const ERROR_TEXT: Record<"room_not_found" | "room_full", string> = {
+const ERROR_TEXT: Record<"room_not_found" | "room_full" | "not_host", string> = {
   room_not_found: "No room exists with that code.",
   room_full: "That room is full.",
+  not_host: "Only the host can change the media.",
 };
 
 function rawDataToString(data: RawData): string {
@@ -76,6 +77,10 @@ export function attachRealtime(wss: WebSocketServer, rooms: RoomStore): void {
       broadcastSnapshot(snapshot, socket);
     }
 
+    function sendAlreadyInRoom(): void {
+      sendError(socket, "already_in_room", "This connection is already in a room.");
+    }
+
     function handleMessage(data: RawData, isBinary: boolean): void {
       if (isBinary) {
         sendError(socket, "invalid_message", "Binary messages are not supported.");
@@ -96,25 +101,46 @@ export function attachRealtime(wss: WebSocketServer, rooms: RoomStore): void {
         return;
       }
 
-      if (session) {
-        sendError(socket, "already_in_room", "This connection is already in a room.");
-        return;
-      }
-
       const message = parsed.message;
       switch (message.type) {
         case "room.create": {
+          if (session) {
+            sendAlreadyInRoom();
+            return;
+          }
           const { participant, snapshot } = rooms.createRoom(message.displayName);
           enterRoom(snapshot, participant.id);
           return;
         }
         case "room.join": {
+          if (session) {
+            sendAlreadyInRoom();
+            return;
+          }
           const result = rooms.joinRoom(message.roomId, message.displayName);
           if (!result.ok) {
             sendError(socket, result.error, ERROR_TEXT[result.error]);
             return;
           }
           enterRoom(result.snapshot, result.participant.id);
+          return;
+        }
+        case "media.set": {
+          if (!session) {
+            sendError(socket, "not_in_room", "Join a room before sharing media.");
+            return;
+          }
+          // Permission is checked against the server-side session, never client data.
+          const result = rooms.setMedia(
+            session.roomId,
+            session.participantId,
+            message.media,
+          );
+          if (!result.ok) {
+            sendError(socket, result.error, ERROR_TEXT[result.error]);
+            return;
+          }
+          broadcastSnapshot(result.snapshot);
           return;
         }
       }

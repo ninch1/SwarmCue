@@ -11,6 +11,16 @@ import { createCoordinationServer, type CoordinationServer } from "../server.js"
 
 const MESSAGE_TIMEOUT_MS = 2000;
 
+const media = {
+  magnetUri: "magnet:?xt=urn:btih:c9e15763f722f23e98a29decdfae341b98d53056&dn=movie.mp4",
+  name: "movie.mp4",
+  sizeBytes: 1024,
+};
+
+function mediaSet(sharedMedia: unknown) {
+  return { type: "media.set", protocolVersion: ProtocolVersion, media: sharedMedia };
+}
+
 type TestClient = {
   socket: WebSocket;
   send: (message: unknown) => void;
@@ -77,6 +87,32 @@ describe("realtime rooms", () => {
     const created = await connect(url);
     clients.push(created);
     return created;
+  }
+
+  /** Ada creates a room (host) and Grace joins it; all join messages are consumed. */
+  async function hostAndViewer() {
+    const host = await client();
+    host.send({ type: "room.create", protocolVersion: ProtocolVersion, displayName: "Ada" });
+    const created = await host.next();
+    if (created.type !== "room.joined") throw new Error("expected room.joined");
+
+    const viewer = await client();
+    viewer.send({
+      type: "room.join",
+      protocolVersion: ProtocolVersion,
+      roomId: created.snapshot.roomId,
+      displayName: "Grace",
+    });
+    const joined = await viewer.next();
+    if (joined.type !== "room.joined") throw new Error("expected room.joined");
+    await host.next();
+
+    return {
+      host,
+      viewer,
+      roomId: created.snapshot.roomId,
+      viewerId: joined.selfId,
+    };
   }
 
   beforeEach(async () => {
@@ -151,8 +187,92 @@ describe("realtime rooms", () => {
       type: "room.snapshot",
       snapshot: {
         roomId: created.snapshot.roomId,
+        hostId: created.selfId,
         participants: [{ id: created.selfId, displayName: "Ada" }],
+        media: null,
       },
+    });
+  });
+
+  it("promotes the remaining participant when the host disconnects", async () => {
+    const { host, viewer, roomId, viewerId } = await hostAndViewer();
+
+    await host.close();
+
+    expect(await viewer.next()).toEqual({
+      type: "room.snapshot",
+      snapshot: {
+        roomId,
+        hostId: viewerId,
+        participants: [{ id: viewerId, displayName: "Grace" }],
+        media: null,
+      },
+    });
+  });
+
+  it("broadcasts media set by the host to everyone, including the host", async () => {
+    const { host, viewer } = await hostAndViewer();
+
+    host.send(mediaSet(media));
+
+    const hostUpdate = await host.next();
+    const viewerUpdate = await viewer.next();
+    expect(hostUpdate).toMatchObject({ type: "room.snapshot", snapshot: { media } });
+    expect(viewerUpdate).toEqual(hostUpdate);
+  });
+
+  it("rejects media from a non-host without broadcasting", async () => {
+    const { host, viewer } = await hostAndViewer();
+
+    viewer.send(mediaSet(media));
+    expect(await viewer.next()).toMatchObject({ type: "error", code: "not_host" });
+
+    // If the rejected attempt had been broadcast, it would arrive before this one.
+    const hostMedia = { ...media, name: "host.mp4" };
+    host.send(mediaSet(hostMedia));
+    expect(await host.next()).toMatchObject({
+      type: "room.snapshot",
+      snapshot: { media: hostMedia },
+    });
+    expect(await viewer.next()).toMatchObject({
+      type: "room.snapshot",
+      snapshot: { media: hostMedia },
+    });
+  });
+
+  it("rejects media before joining a room", async () => {
+    const ada = await client();
+
+    ada.send(mediaSet(media));
+
+    expect(await ada.next()).toMatchObject({ type: "error", code: "not_in_room" });
+  });
+
+  it("rejects a malformed magnet", async () => {
+    const { host } = await hostAndViewer();
+
+    host.send(mediaSet({ ...media, magnetUri: "magnet:?xt=urn:btih:nope" }));
+
+    expect(await host.next()).toMatchObject({ type: "error", code: "invalid_message" });
+  });
+
+  it("includes the current media when a participant joins late", async () => {
+    const { host, viewer, roomId } = await hostAndViewer();
+    host.send(mediaSet(media));
+    await host.next();
+    await viewer.next();
+
+    const late = await client();
+    late.send({
+      type: "room.join",
+      protocolVersion: ProtocolVersion,
+      roomId,
+      displayName: "Linus",
+    });
+
+    expect(await late.next()).toMatchObject({
+      type: "room.joined",
+      snapshot: { media },
     });
   });
 

@@ -1,8 +1,10 @@
 import {
   ClientMessageSchema,
   ProtocolVersion,
+  type ClientMessage,
   type ParticipantId,
   type RoomSnapshot,
+  type SharedMedia,
 } from "@swarmcue/protocol";
 import { useEffect, useRef, useState } from "react";
 import { openRoomConnection, type RoomConnection } from "./connection.js";
@@ -11,14 +13,37 @@ import { normalizeRoomCode } from "./roomCode.js";
 export type RoomState =
   | { status: "idle"; error: string | null }
   | { status: "connecting" }
-  | { status: "in-room"; selfId: ParticipantId; snapshot: RoomSnapshot };
+  | {
+      status: "in-room";
+      selfId: ParticipantId;
+      snapshot: RoomSnapshot;
+      /** Latest server error while in the room; cleared by the next snapshot. */
+      error: string | null;
+    };
 
 export type UseRoom = {
   state: RoomState;
   createRoom: (displayName: string) => void;
   joinRoom: (roomCode: string, displayName: string) => void;
   leaveRoom: () => void;
+  /**
+   * Host only: share media with the room. Returns a validation message when
+   * the media cannot be sent, otherwise null.
+   */
+  setMedia: (media: SharedMedia) => string | null;
 };
+
+/** Returns the validated message, or the first validation message as a string. */
+function validateClientMessage(
+  rawMessage: unknown,
+  fallback: string,
+): ClientMessage | string {
+  const parsed = ClientMessageSchema.safeParse(rawMessage);
+  if (!parsed.success) {
+    return parsed.error.issues[0]?.message ?? fallback;
+  }
+  return parsed.data;
+}
 
 /**
  * One WebSocket per room session: opened on create/join, closed on leave.
@@ -27,6 +52,8 @@ export type UseRoom = {
 export function useRoom(): UseRoom {
   const [state, setState] = useState<RoomState>({ status: "idle", error: null });
   const connectionRef = useRef<RoomConnection | null>(null);
+  /** The connection that has completed create/join; null while connecting or idle. */
+  const joinedConnectionRef = useRef<RoomConnection | null>(null);
 
   useEffect(() => {
     return () => {
@@ -39,20 +66,17 @@ export function useRoom(): UseRoom {
   function closeCurrent(): void {
     const connection = connectionRef.current;
     connectionRef.current = null;
+    joinedConnectionRef.current = null;
     connection?.close();
   }
 
   function start(rawMessage: unknown): void {
     // Validate locally first so the user gets immediate, specific feedback.
-    const parsed = ClientMessageSchema.safeParse(rawMessage);
-    if (!parsed.success) {
-      setState({
-        status: "idle",
-        error: parsed.error.issues[0]?.message ?? "Invalid room details.",
-      });
+    const firstMessage = validateClientMessage(rawMessage, "Invalid room details.");
+    if (typeof firstMessage === "string") {
+      setState({ status: "idle", error: firstMessage });
       return;
     }
-    const firstMessage = parsed.data;
 
     closeCurrent();
     setState({ status: "connecting" });
@@ -69,22 +93,28 @@ export function useRoom(): UseRoom {
         switch (message.type) {
           case "room.joined":
             joined = true;
+            joinedConnectionRef.current = connection;
             setState({
               status: "in-room",
               selfId: message.selfId,
               snapshot: message.snapshot,
+              error: null,
             });
             return;
           case "room.snapshot":
             setState((previous) =>
               previous.status === "in-room"
-                ? { ...previous, snapshot: message.snapshot }
+                ? { ...previous, snapshot: message.snapshot, error: null }
                 : previous,
             );
             return;
           case "error":
             if (joined) {
-              console.error("Room server error:", message.code, message.message);
+              setState((previous) =>
+                previous.status === "in-room"
+                  ? { ...previous, error: message.message }
+                  : previous,
+              );
               return;
             }
             closeCurrent();
@@ -98,6 +128,7 @@ export function useRoom(): UseRoom {
           return;
         }
         connectionRef.current = null;
+        joinedConnectionRef.current = null;
         setState({
           status: "idle",
           error: joined
@@ -125,6 +156,22 @@ export function useRoom(): UseRoom {
     leaveRoom: () => {
       closeCurrent();
       setState({ status: "idle", error: null });
+    },
+    setMedia: (media) => {
+      // A ref, not `state`: callers may invoke this after an async step.
+      const connection = joinedConnectionRef.current;
+      if (!connection) {
+        return "Join a room before sharing media.";
+      }
+      const message = validateClientMessage(
+        { type: "media.set", protocolVersion: ProtocolVersion, media },
+        "This media cannot be shared.",
+      );
+      if (typeof message === "string") {
+        return message;
+      }
+      connection.send(message);
+      return null;
     },
   };
 }
