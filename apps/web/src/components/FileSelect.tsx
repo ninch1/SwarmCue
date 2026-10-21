@@ -22,7 +22,7 @@ export function FileSelect({
         Local file
       </h2>
       <p className="m-0 text-sm text-muted">
-        Play locally and generate a magnet link other clients can paste.
+        Play a video from this device and share it with the room.
       </p>
       <label className="inline-flex w-fit cursor-pointer" htmlFor={inputId}>
         <span className="inline-flex items-center justify-center rounded-lg border border-border bg-panel px-3.5 py-2 text-ink hover:border-accent">

@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { FileSelect } from "./components/FileSelect.js";
-import { GeneratedMagnet } from "./components/GeneratedMagnet.js";
 import { MagnetPaste } from "./components/MagnetPaste.js";
 import {
   MagnetStatus,
   type MagnetPlaybackState,
 } from "./components/MagnetStatus.js";
 import { RoomPanel } from "./components/RoomPanel.js";
+import {
+  SharingStatus,
+  type SharingState,
+} from "./components/SharingStatus.js";
 import { VideoPlayer } from "./components/VideoPlayer.js";
 import { isMagnetUri, magnetMetadata, toMediaName } from "./media/magnet.js";
 import { useRoom } from "./room/useRoom.js";
@@ -212,6 +215,37 @@ export function App() {
   const fileName = source.kind === "file" ? source.fileName : null;
   const pastedMagnetUri = source.kind === "magnet" ? source.magnetUri : null;
 
+  // The host's media counts as shared only once a server snapshot carries it.
+  const hostMagnetUri =
+    magnetGeneration.status === "ready"
+      ? magnetGeneration.magnetUri
+      : pastedMagnetUri;
+  const roomError = room.state.status === "in-room" ? room.state.error : null;
+  const otherParticipants =
+    room.state.status === "in-room"
+      ? room.state.snapshot.participants.length - 1
+      : 0;
+  let sharing: SharingState | null = null;
+  if (magnetGeneration.status === "creating") {
+    sharing = { status: "creating" };
+  } else if (magnetGeneration.status === "error") {
+    sharing = { status: "error", message: magnetGeneration.error };
+  } else if (shareError) {
+    sharing = {
+      status: "error",
+      message: `Could not share with the room: ${shareError}`,
+    };
+  } else if (hostMagnetUri && hostMagnetUri === sharedMagnetUri) {
+    sharing = { status: "shared", otherParticipants };
+  } else if (hostMagnetUri && roomError) {
+    sharing = {
+      status: "error",
+      message: `Could not share with the room: ${roomError}`,
+    };
+  } else if (hostMagnetUri) {
+    sharing = { status: "sharing" };
+  }
+
   let emptyPlayerMessage = "Create or join a room to watch together.";
   if (isHost) {
     emptyPlayerMessage = "Choose a local video file or paste a magnet link.";
@@ -271,17 +305,7 @@ export function App() {
             />
           </div>
 
-          {shareError ? (
-            <p className="m-0 text-sm text-danger" role="alert">
-              Could not share with the room: {shareError}
-            </p>
-          ) : null}
-
-          <GeneratedMagnet
-            magnetUri={magnetGeneration.magnetUri}
-            status={magnetGeneration.status}
-            error={magnetGeneration.error}
-          />
+          {sharing ? <SharingStatus state={sharing} /> : null}
         </>
       ) : null}
     </div>

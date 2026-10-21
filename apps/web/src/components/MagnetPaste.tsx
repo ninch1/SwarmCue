@@ -30,7 +30,7 @@ export function MagnetPaste({
         Magnet link
       </h2>
       <p className="m-0 text-sm text-muted">
-        Paste a magnet URI from another client to stream it here.
+        Paste a magnet link to stream it here and share it with the room.
       </p>
       <form className="flex flex-col gap-2" onSubmit={handleSubmit}>
         <label className="sr-only" htmlFor={inputId}>
