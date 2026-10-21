@@ -1,15 +1,13 @@
 import WebTorrent from "webtorrent";
 import type { Torrent } from "webtorrent";
-import { pickVideoFile } from "../media/videoFile.js";
 import { prepareTorrentStorage } from "./storage.js";
 
 /**
  * Browser peers can only use WebSocket trackers (wss://), not udp://.
- * Included in created magnets so a pasted link can discover peers later.
+ * Written into the magnets the host creates so viewers can find peers.
  */
 const BROWSER_TRACKERS = [
   "wss://tracker.openwebtorrent.com",
-  "wss://tracker.btorrent.xyz",
   "wss://tracker.webtorrent.dev",
 ] as const;
 
@@ -79,12 +77,20 @@ async function removeActiveTorrent(): Promise<void> {
 
   const torrent = activeTorrent;
   activeTorrent = null;
+  const torrentClient = client;
 
-  try {
-    await client.remove(torrent);
-  } catch (error) {
-    console.error("Failed to remove previous torrent:", error);
-  }
+  // client.remove() resolves before the store is destroyed. Wait for the
+  // destroy callback, otherwise re-adding the same info hash reuses a store
+  // folder that is still being deleted and writes fail.
+  await new Promise<void>((resolve) => {
+    const done = (error?: unknown) => {
+      if (error) {
+        console.error("Failed to remove previous torrent:", error);
+      }
+      resolve();
+    };
+    torrentClient.remove(torrent, done).catch(done);
+  });
 }
 
 function supersededError(): Error {
@@ -131,7 +137,7 @@ function ensureStreamServer(torrentClient: WebTorrent): Promise<void> {
     streamServerReady = (async () => {
       if (!("serviceWorker" in navigator)) {
         throw new Error(
-          "This browser does not support service workers, which magnet playback requires.",
+          "This browser does not support service workers, which streaming shared videos requires.",
         );
       }
       await navigator.serviceWorker.register(SERVICE_WORKER_URL, {
@@ -186,8 +192,8 @@ export async function createMagnetFromFile(file: File): Promise<string> {
 }
 
 /**
- * Join a torrent by magnet URI and resolve with a URL the <video> element
- * can stream from while pieces download.
+ * Join the torrent the host shared and resolve with a URL the <video>
+ * element can stream from while pieces download.
  */
 export async function playMagnet(
   magnetUri: string,
@@ -206,15 +212,15 @@ export async function playMagnet(
     const torrent = torrentClient.add(
       magnetUri,
       {
-        // Adds browser trackers in case the pasted magnet only lists udp:// ones.
         announce: [...BROWSER_TRACKERS],
         // Downloaded pieces are not kept once the user switches media.
         destroyStoreOnDestroy: true,
       },
       (ready) => {
-        const file = pickVideoFile(ready.files);
+        // The host seeds exactly one selected file per torrent.
+        const file = ready.files.length === 1 ? ready.files[0] : undefined;
         if (!file) {
-          reject(new Error("This torrent has no browser-playable video file."));
+          reject(new Error("Shared media is not a single video file."));
           return;
         }
         resolve({ fileName: file.name, streamUrl: file.streamURL });

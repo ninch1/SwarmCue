@@ -30,7 +30,7 @@ export function MagnetStatus({ playback, stats }: MagnetStatusProps) {
       role="status"
     >
       {playback.status === "loading" ? (
-        <>Finding peers and fetching torrent metadata… · {peers}</>
+        <>Connecting to the host's video… · {peers}</>
       ) : (
         <>
           Streaming <span className="text-ink">{playback.fileName}</span> ·{" "}

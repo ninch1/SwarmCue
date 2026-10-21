@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { FileSelect } from "./components/FileSelect.js";
-import { MagnetPaste } from "./components/MagnetPaste.js";
 import {
   MagnetStatus,
   type MagnetPlaybackState,
@@ -11,7 +10,7 @@ import {
   type SharingState,
 } from "./components/SharingStatus.js";
 import { VideoPlayer } from "./components/VideoPlayer.js";
-import { isMagnetUri, magnetMetadata, toMediaName } from "./media/magnet.js";
+import { toMediaName } from "./media/mediaName.js";
 import { useRoom } from "./room/useRoom.js";
 import {
   createMagnetFromFile,
@@ -44,7 +43,6 @@ function errorMessage(error: unknown, fallback: string): string {
 export function App() {
   const room = useRoom();
   const [source, setSource] = useState<MediaSource>({ kind: "none" });
-  const [magnetError, setMagnetError] = useState<string | null>(null);
   const [magnetGeneration, setMagnetGeneration] = useState<MagnetGeneration>(
     idleMagnetGeneration,
   );
@@ -99,7 +97,6 @@ export function App() {
   function handleFileSelected(file: File) {
     const requestId = ++magnetRequestIdRef.current;
     loadedMagnetRef.current = null;
-    setMagnetError(null);
     setPlayerError(null);
     setShareError(null);
     setTorrentStats(null);
@@ -143,30 +140,15 @@ export function App() {
         setMagnetGeneration({
           status: "error",
           magnetUri: null,
-          error: errorMessage(error, "Failed to create magnet from file."),
+          error: errorMessage(error, "Could not prepare this video for sharing."),
         });
       });
   }
 
-  /** Host: paste a magnet, play it locally, and share it with the room. */
-  function handleMagnetSubmit(rawMagnet: string) {
-    const magnetUri = rawMagnet.trim();
-    if (!isMagnetUri(magnetUri)) {
-      setMagnetError(
-        "Enter a valid magnet link (must include xt=urn:btih:…).",
-      );
-      return;
-    }
-
-    loadMagnet(magnetUri);
-    setShareError(room.setMedia({ magnetUri, ...magnetMetadata(magnetUri) }));
-  }
-
-  /** Stream a magnet into the local player. Used by the host's paste and by viewers. */
+  /** Viewers: stream the host's shared video into the local player. */
   function loadMagnet(magnetUri: string) {
     const requestId = ++magnetRequestIdRef.current;
     loadedMagnetRef.current = magnetUri;
-    setMagnetError(null);
     setShareError(null);
     setPlayerError(null);
     setTorrentStats(null);
@@ -200,7 +182,7 @@ export function App() {
           magnetUri,
           playback: {
             status: "error",
-            error: errorMessage(error, "Failed to load magnet."),
+            error: errorMessage(error, "Could not load the shared video."),
           },
         });
       });
@@ -213,13 +195,9 @@ export function App() {
     videoSrc = source.playback.streamUrl;
   }
   const fileName = source.kind === "file" ? source.fileName : null;
-  const pastedMagnetUri = source.kind === "magnet" ? source.magnetUri : null;
 
   // The host's media counts as shared only once a server snapshot carries it.
-  const hostMagnetUri =
-    magnetGeneration.status === "ready"
-      ? magnetGeneration.magnetUri
-      : pastedMagnetUri;
+  const hostMagnetUri = magnetGeneration.magnetUri;
   const roomError = room.state.status === "in-room" ? room.state.error : null;
   const otherParticipants =
     room.state.status === "in-room"
@@ -248,7 +226,7 @@ export function App() {
 
   let emptyPlayerMessage = "Create or join a room to watch together.";
   if (isHost) {
-    emptyPlayerMessage = "Choose a local video file or paste a magnet link.";
+    emptyPlayerMessage = "Choose a video from this device to share with the room.";
   } else if (inRoom) {
     emptyPlayerMessage = sharedMagnetUri
       ? "Loading the host's media…"
@@ -262,8 +240,8 @@ export function App() {
           SwarmCue
         </h1>
         <p className="mt-1.5 text-muted">
-          Create or join a room. The host shares a video, and everyone else
-          streams it from the host.
+          Pick a video on your device and watch it with friends. It streams
+          directly between everyone in the room.
         </p>
       </header>
 
@@ -291,19 +269,11 @@ export function App() {
 
       {isHost ? (
         <>
-          <div className="grid gap-4 min-[720px]:grid-cols-2">
-            <FileSelect
-              fileName={fileName}
-              onFileSelected={handleFileSelected}
-              disabled={magnetGeneration.status === "creating"}
-            />
-            <MagnetPaste
-              magnetUri={pastedMagnetUri}
-              error={magnetError}
-              onMagnetSubmit={handleMagnetSubmit}
-              disabled={magnetGeneration.status === "creating"}
-            />
-          </div>
+          <FileSelect
+            fileName={fileName}
+            onFileSelected={handleFileSelected}
+            disabled={magnetGeneration.status === "creating"}
+          />
 
           {sharing ? <SharingStatus state={sharing} /> : null}
         </>

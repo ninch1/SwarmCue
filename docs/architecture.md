@@ -6,6 +6,10 @@
 
 SwarmCue is a browser-first, peer-to-peer watch-party application for small private rooms.
 
+SwarmCue lets someone select a local video and watch it with friends. The file is progressively distributed directly between room participants while a coordination server keeps playback synchronized.
+
+It is neither conventional server-side video streaming nor a general torrent application. It combines private peer-to-peer media distribution with synchronized watch-party coordination.
+
 The system separates two main responsibilities:
 
 1. **Media delivery:** WebTorrent and WebRTC deliver media directly between participants.
@@ -16,6 +20,11 @@ The coordination server does not upload, store, transcode, or stream the video i
 ## V1 Architectural Constraints
 
 - The application is browser-first and supports media formats the browser can play natively.
+- V1 accepts local, browser-compatible video files chosen by an authorized participant (the host).
+- SwarmCue internally creates one browser-compatible torrent per selected file.
+- The generated magnet URI is distributed to participants through the coordination server as room state.
+- Arbitrary user-provided magnet links are not supported in V1.
+- WebTorrent and magnet URIs are implementation details, not user-facing concepts.
 - Rooms are temporary and anonymous; users do not need accounts.
 - A room is designed and tested for up to five participants.
 - Shared room state is stored in the coordination server's memory.
@@ -42,6 +51,32 @@ Each participant runs the SwarmCue web client in their browser.
 The browser clients maintain WebSocket connections to the coordination server for shared room state. Media pieces travel directly between participating peers through WebTorrent rather than passing through the coordination server.
 WebTorrent-compatible trackers help peers discover and establish connections with each other. They do not act as the source of the media.
 
+## Media Sharing Flow
+
+1. The host selects a local video.
+2. The host's browser creates and seeds a WebTorrent torrent for that file.
+3. SwarmCue generates a browser-compatible magnet URI for the torrent.
+4. The client sends the magnet URI and media metadata (name, size) to the coordination server.
+5. The server checks that the sender is allowed to change the media, stores it as the current media, and distributes it to room participants.
+6. Other clients automatically join the generated torrent and progressively play the video.
+7. Participants redistribute downloaded pieces among themselves when possible.
+
+The video file itself never passes through the coordination server. The server only stores and forwards the magnet URI and metadata.
+
+```mermaid
+sequenceDiagram
+    participant Host as HostBrowser
+    participant Server as CoordinationServer
+    participant Viewer as ViewerBrowser
+    Host->>Host: select local file, seed, internal magnet
+    Host->>Server: "media.set {magnetUri, name, sizeBytes}"
+    Server->>Server: validate host and magnet, store media
+    Server-->>Viewer: room.snapshot with media
+    Viewer->>Host: join torrent over WebRTC
+    Viewer->>Viewer: stream the file into the video element
+    Viewer-->>Viewer: redistribute pieces to other viewers
+```
+
 ## Browser Client Responsibilities
 
 The browser client is responsible for:
@@ -54,7 +89,8 @@ The browser client is responsible for:
 - Comparing local playback with the expected room position.
 - Correcting playback drift when necessary.
 - Reporting local readiness, buffering, and connection status.
-- Using WebTorrent to discover peers and download or seed media pieces.
+- Creating and seeding a torrent from the host's selected local file.
+- Joining the shared torrent, streaming it progressively, and redistributing downloaded pieces.
 - Connecting progressively downloaded media to the video player.
 - Managing personal subtitles and displaying shared subtitles.
 
@@ -67,7 +103,7 @@ The coordination server is responsible for:
 - Maintaining authoritative shared room state.
 - Managing host and controller permissions.
 - Validating whether participants are allowed to perform requested actions.
-- Managing the media queue and currently selected media.
+- Managing the media queue and currently selected media (the internal magnet URI and its metadata; never the file itself).
 - Accepting playback commands such as play, pause, and seek.
 - Updating and broadcasting authoritative playback state.
 - Managing buffering reports and pause requests.
@@ -109,6 +145,8 @@ A snapshot simply means a complete description of the room at that moment.
 The participant who creates a room is its host. Only the host may change the shared media; the server checks this against the sender's server-side session, not against anything the client claims.
 
 Until reconnection grace periods are designed, host ownership transfers immediately: when the host disconnects, the earliest-joined remaining participant becomes host. The shared media is kept, which may leave it without a seeder (see Known Limitations).
+
+Host authority and media availability are separate. Transferring host status changes who may control the room; it cannot restore pieces of the file that no remaining participant has.
 
 ## Playback Synchronization Model
 
@@ -191,11 +229,18 @@ Vitest is the test runner. Specific remaining library choices (for example WebTo
 - Active rooms are lost when the coordination server restarts.
 - V1 cannot distribute rooms across multiple server instances.
 - Playback is limited to formats and codecs supported by the participant's browser.
-- A magnet link may be unusable when no compatible peers are available.
+- Shared media stays available only while participants who hold the needed pieces remain connected. If the original host leaves before others have downloaded the file, playback may stall.
 - Host transfer does not guarantee continued media availability.
-- Media availability may be lost when the necessary seeders disconnect.
 - Peer discovery depends on available WebTorrent-compatible trackers.
+- Browsers cannot connect to ordinary BitTorrent swarms (TCP/UDP peers, `udp://` trackers), so public torrents are not supported.
 - SwarmCue does not provide server-side transcoding or media fallback.
+
+## Out of Scope for V1
+
+- Arbitrary user-provided magnet links.
+- Public torrent swarms.
+- A desktop or native companion application that bridges conventional TCP/UDP BitTorrent swarms to browser WebRTC peers.
+- Acting as a general browser torrent client.
 
 ## Deferred Decisions
 
