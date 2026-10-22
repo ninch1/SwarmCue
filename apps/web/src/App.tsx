@@ -62,6 +62,8 @@ export function App() {
     room.state.status === "in-room"
       ? (room.state.snapshot.media?.magnetUri ?? null)
       : null;
+  const playback =
+    room.state.status === "in-room" ? room.state.snapshot.playback : null;
 
   useEffect(() => {
     return () => {
@@ -250,6 +252,13 @@ export function App() {
       <VideoPlayer
         src={videoSrc}
         emptyMessage={emptyPlayerMessage}
+        playback={playback}
+        onLocalPlaybackChange={(status) => {
+          const error = room.setPlayback(status);
+          if (error) {
+            console.error("Could not send playback command:", error);
+          }
+        }}
         onError={() => {
           setPlayerError(
             "The browser could not play this video. Its format or codec may be unsupported.",

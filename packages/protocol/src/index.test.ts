@@ -161,7 +161,37 @@ describe("media.set", () => {
   });
 });
 
+describe("playback.set", () => {
+  it.each(["playing", "paused"])("accepts %s", (status) => {
+    expect(
+      parseClientMessage({
+        type: "playback.set",
+        protocolVersion: ProtocolVersion,
+        status,
+      }).ok,
+    ).toBe(true);
+  });
+
+  it.each([
+    ["unknown status", { status: "stopped" }],
+    ["missing status", {}],
+    ["extra keys", { status: "playing", positionSec: 10 }],
+  ])("rejects %s", (_label, fields) => {
+    const result = parseClientMessage({
+      type: "playback.set",
+      protocolVersion: ProtocolVersion,
+      ...fields,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("invalid_message");
+    }
+  });
+});
+
 describe("ServerMessageSchema", () => {
+  const pausedPlayback = { status: "paused", revision: 0 };
+
   it("accepts a room.joined message", () => {
     const result = ServerMessageSchema.safeParse({
       type: "room.joined",
@@ -171,10 +201,40 @@ describe("ServerMessageSchema", () => {
         hostId: "p1",
         participants: [{ id: "p1", displayName: "Ada" }],
         media: { magnetUri: validMagnet, name: "movie.mp4", sizeBytes: 1024 },
+        playback: { status: "playing", revision: 3 },
       },
     });
 
     expect(result.success).toBe(true);
+  });
+
+  it("rejects a snapshot without playback state", () => {
+    const result = ServerMessageSchema.safeParse({
+      type: "room.snapshot",
+      snapshot: {
+        roomId: validRoomId,
+        hostId: "p1",
+        participants: [{ id: "p1", displayName: "Ada" }],
+        media: null,
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a snapshot with a negative playback revision", () => {
+    const result = ServerMessageSchema.safeParse({
+      type: "room.snapshot",
+      snapshot: {
+        roomId: validRoomId,
+        hostId: "p1",
+        participants: [{ id: "p1", displayName: "Ada" }],
+        media: null,
+        playback: { status: "paused", revision: -1 },
+      },
+    });
+
+    expect(result.success).toBe(false);
   });
 
   it("rejects a snapshot whose host is not a participant", () => {
@@ -185,6 +245,7 @@ describe("ServerMessageSchema", () => {
         hostId: "p2",
         participants: [{ id: "p1", displayName: "Ada" }],
         media: null,
+        playback: pausedPlayback,
       },
     });
 

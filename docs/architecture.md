@@ -13,7 +13,7 @@ It is neither conventional server-side video streaming nor a general torrent app
 The system separates two main responsibilities:
 
 1. **Media delivery:** WebTorrent and WebRTC deliver media directly between participants.
-2. **Room coordination:** A central server manages participants, permissions, queue state, and synchronized playback.
+2. **Room coordination:** A central server manages participants, permissions, current media, and synchronized playback.
 
 The coordination server does not upload, store, transcode, or stream the video itself.
 
@@ -103,7 +103,7 @@ The coordination server is responsible for:
 - Maintaining authoritative shared room state.
 - Managing host and controller permissions.
 - Validating whether participants are allowed to perform requested actions.
-- Managing the media queue and currently selected media (the internal magnet URI and its metadata; never the file itself).
+- Managing the currently selected media (the internal magnet URI and its metadata; never the file itself).
 - Accepting playback commands such as play, pause, and seek.
 - Updating and broadcasting authoritative playback state.
 - Managing buffering reports and pause requests.
@@ -124,7 +124,7 @@ Shared room state is authoritative on the coordination server. A client may requ
 | ------------------------------------- | ----------------------------- |
 | Room membership                       | Coordination server           |
 | Host and controller roles             | Coordination server           |
-| Media queue and selected media        | Coordination server           |
+| Selected media                        | Coordination server           |
 | Shared playback state                 | Coordination server           |
 | Pending pause requests                | Coordination server           |
 | Shared subtitle selection             | Coordination server           |
@@ -168,6 +168,16 @@ Clients compare the expected room position with their local video position. Smal
 Playback commands are processed by the server before becoming shared room state. This prevents multiple clients from independently deciding the room's playback position.
 
 This model means the server does **not** need to broadcast a timestamp every second. Clients can calculate where playback should currently be.
+
+### V1 first step: shared play/pause flag
+
+The first implemented step shares only a `playing`/`paused` status plus a revision number that increases on every accepted change. Clients apply the room status when the revision changes or when a new video element loads, and report their own play/pause actions as commands. Positions are not shared yet: each client plays or pauses at its own current time. The position and drift model above comes later.
+
+### Playback control (V1)
+
+- Any participant may play or pause. The server applies commands in arrival order, so the last command wins.
+- Host-only playback control may later become a room setting; controller roles come after V1.
+- New media always resets playback to paused at position 0.
 
 ## Server and Deployment Structure
 
@@ -231,6 +241,7 @@ Vitest is the test runner. Specific remaining library choices (for example WebTo
 - Playback is limited to formats and codecs supported by the participant's browser.
 - Shared media stays available only while participants who hold the needed pieces remain connected. If the original host leaves before others have downloaded the file, playback may stall.
 - Host transfer does not guarantee continued media availability.
+- Until position sync exists, participants who join mid-playback start from the beginning, and positions can drift apart.
 - Peer discovery depends on available WebTorrent-compatible trackers.
 - Browsers cannot connect to ordinary BitTorrent swarms (TCP/UDP peers, `udp://` trackers), so public torrents are not supported.
 - SwarmCue does not provide server-side transcoding or media fallback.
@@ -239,6 +250,7 @@ Vitest is the test runner. Specific remaining library choices (for example WebTo
 
 - Arbitrary user-provided magnet links.
 - Public torrent swarms.
+- A media queue; a room has one current media item.
 - A desktop or native companion application that bridges conventional TCP/UDP BitTorrent swarms to browser WebRTC peers.
 - Acting as a general browser torrent client.
 

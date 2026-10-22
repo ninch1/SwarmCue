@@ -4,6 +4,8 @@
 import type {
   Participant,
   ParticipantId,
+  PlaybackState,
+  PlaybackStatus,
   RoomId,
   RoomSnapshot,
   SharedMedia,
@@ -32,12 +34,20 @@ export type SetMediaResult =
   | { ok: true; snapshot: RoomSnapshot }
   | { ok: false; error: SetMediaError };
 
+export type SetPlaybackError = "room_not_found" | "not_in_room" | "no_media";
+
+export type SetPlaybackResult =
+  /** `changed` is false when the requested status was already in effect. */
+  | { ok: true; changed: boolean; snapshot: RoomSnapshot }
+  | { ok: false; error: SetPlaybackError };
+
 type Room = {
   id: RoomId;
   hostId: ParticipantId;
   /** Join order. */
   participants: Participant[];
   media: SharedMedia | null;
+  playback: PlaybackState;
 };
 
 const MAX_ROOM_ID_ATTEMPTS = 10;
@@ -51,6 +61,7 @@ export function createRoomStore(options: RoomStoreOptions) {
       hostId: room.hostId,
       participants: room.participants.map((participant) => ({ ...participant })),
       media: room.media ? { ...room.media } : null,
+      playback: { ...room.playback },
     };
   }
 
@@ -76,6 +87,7 @@ export function createRoomStore(options: RoomStoreOptions) {
         hostId: participant.id,
         participants: [participant],
         media: null,
+        playback: { status: "paused", revision: 0 },
       };
       rooms.set(room.id, room);
       return { participant: { ...participant }, snapshot: toSnapshot(room) };
@@ -123,7 +135,10 @@ export function createRoomStore(options: RoomStoreOptions) {
       return toSnapshot(room);
     },
 
-    /** Replace the shared media. Only the current host may do this. */
+    /**
+     * Replace the shared media. Only the current host may do this. New media
+     * always starts paused.
+     */
     setMedia(
       roomId: RoomId,
       participantId: ParticipantId,
@@ -137,7 +152,34 @@ export function createRoomStore(options: RoomStoreOptions) {
         return { ok: false, error: "not_host" };
       }
       room.media = { ...media };
+      room.playback = { status: "paused", revision: room.playback.revision + 1 };
       return { ok: true, snapshot: toSnapshot(room) };
+    },
+
+    /**
+     * Play or pause the shared media. Any participant may do this in V1; the
+     * server applies commands in arrival order.
+     */
+    setPlayback(
+      roomId: RoomId,
+      participantId: ParticipantId,
+      status: PlaybackStatus,
+    ): SetPlaybackResult {
+      const room = rooms.get(roomId);
+      if (!room) {
+        return { ok: false, error: "room_not_found" };
+      }
+      if (!room.participants.some((participant) => participant.id === participantId)) {
+        return { ok: false, error: "not_in_room" };
+      }
+      if (!room.media) {
+        return { ok: false, error: "no_media" };
+      }
+      if (room.playback.status === status) {
+        return { ok: true, changed: false, snapshot: toSnapshot(room) };
+      }
+      room.playback = { status, revision: room.playback.revision + 1 };
+      return { ok: true, changed: true, snapshot: toSnapshot(room) };
     },
 
     getSnapshot(roomId: RoomId): RoomSnapshot | null {

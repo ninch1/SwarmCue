@@ -3,6 +3,7 @@ import {
   ProtocolVersion,
   type ClientMessage,
   type ParticipantId,
+  type PlaybackStatus,
   type RoomSnapshot,
   type SharedMedia,
 } from "@swarmcue/protocol";
@@ -31,6 +32,11 @@ export type UseRoom = {
    * the media cannot be sent, otherwise null.
    */
   setMedia: (media: SharedMedia) => string | null;
+  /**
+   * Any participant: play or pause the room's media. Returns a message when
+   * the command cannot be sent, otherwise null.
+   */
+  setPlayback: (status: PlaybackStatus) => string | null;
 };
 
 /** Returns the validated message, or the first validation message as a string. */
@@ -166,6 +172,21 @@ export function useRoom(): UseRoom {
       const message = validateClientMessage(
         { type: "media.set", protocolVersion: ProtocolVersion, media },
         "This media cannot be shared.",
+      );
+      if (typeof message === "string") {
+        return message;
+      }
+      connection.send(message);
+      return null;
+    },
+    setPlayback: (status) => {
+      const connection = joinedConnectionRef.current;
+      if (!connection) {
+        return "Join a room before controlling playback.";
+      }
+      const message = validateClientMessage(
+        { type: "playback.set", protocolVersion: ProtocolVersion, status },
+        "Invalid playback command.",
       );
       if (typeof message === "string") {
         return message;

@@ -21,6 +21,10 @@ function mediaSet(sharedMedia: unknown) {
   return { type: "media.set", protocolVersion: ProtocolVersion, media: sharedMedia };
 }
 
+function playbackSet(status: "playing" | "paused") {
+  return { type: "playback.set", protocolVersion: ProtocolVersion, status };
+}
+
 type TestClient = {
   socket: WebSocket;
   send: (message: unknown) => void;
@@ -115,6 +119,15 @@ describe("realtime rooms", () => {
     };
   }
 
+  /** hostAndViewer, plus shared media; the media snapshots are consumed. */
+  async function roomWithMedia() {
+    const room = await hostAndViewer();
+    room.host.send(mediaSet(media));
+    await room.host.next();
+    await room.viewer.next();
+    return room;
+  }
+
   beforeEach(async () => {
     coordination = createCoordinationServer();
     coordination.server.listen(0, "127.0.0.1");
@@ -190,6 +203,7 @@ describe("realtime rooms", () => {
         hostId: created.selfId,
         participants: [{ id: created.selfId, displayName: "Ada" }],
         media: null,
+        playback: { status: "paused", revision: 0 },
       },
     });
   });
@@ -206,6 +220,7 @@ describe("realtime rooms", () => {
         hostId: viewerId,
         participants: [{ id: viewerId, displayName: "Grace" }],
         media: null,
+        playback: { status: "paused", revision: 0 },
       },
     });
   });
@@ -274,6 +289,71 @@ describe("realtime rooms", () => {
       type: "room.joined",
       snapshot: { media },
     });
+  });
+
+  it("lets a viewer play and the host pause, broadcasting each change to everyone", async () => {
+    const { host, viewer } = await roomWithMedia();
+
+    viewer.send(playbackSet("playing"));
+    const playing = { type: "room.snapshot", snapshot: { playback: { status: "playing" } } };
+    expect(await viewer.next()).toMatchObject(playing);
+    expect(await host.next()).toMatchObject(playing);
+
+    host.send(playbackSet("paused"));
+    const paused = { type: "room.snapshot", snapshot: { playback: { status: "paused" } } };
+    expect(await host.next()).toMatchObject(paused);
+    expect(await viewer.next()).toMatchObject(paused);
+  });
+
+  it("does not broadcast a playback status that is already in effect", async () => {
+    const { host, viewer } = await roomWithMedia();
+    viewer.send(playbackSet("playing"));
+    await viewer.next();
+    await host.next();
+
+    host.send(playbackSet("playing"));
+    // If the repeated command had been broadcast, it would arrive before this one.
+    host.send(playbackSet("paused"));
+    expect(await host.next()).toMatchObject({
+      type: "room.snapshot",
+      snapshot: { playback: { status: "paused" } },
+    });
+    expect(await viewer.next()).toMatchObject({
+      type: "room.snapshot",
+      snapshot: { playback: { status: "paused" } },
+    });
+  });
+
+  it("rejects playback before any media is shared", async () => {
+    const { viewer } = await hostAndViewer();
+
+    viewer.send(playbackSet("playing"));
+
+    expect(await viewer.next()).toMatchObject({ type: "error", code: "no_media" });
+  });
+
+  it("rejects playback before joining a room", async () => {
+    const ada = await client();
+
+    ada.send(playbackSet("playing"));
+
+    expect(await ada.next()).toMatchObject({ type: "error", code: "not_in_room" });
+  });
+
+  it("resets playback to paused for everyone when the host changes media", async () => {
+    const { host, viewer } = await roomWithMedia();
+    viewer.send(playbackSet("playing"));
+    await viewer.next();
+    await host.next();
+
+    host.send(mediaSet({ ...media, name: "other.mp4" }));
+
+    const reset = {
+      type: "room.snapshot",
+      snapshot: { media: { name: "other.mp4" }, playback: { status: "paused" } },
+    };
+    expect(await host.next()).toMatchObject(reset);
+    expect(await viewer.next()).toMatchObject(reset);
   });
 
   it("rejects malformed messages and keeps the connection usable", async () => {

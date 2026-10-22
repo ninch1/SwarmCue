@@ -64,6 +64,17 @@ export const SharedMediaSchema = z.strictObject({
   sizeBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
 });
 
+export const PlaybackStatusSchema = z.enum(["playing", "paused"]);
+
+/**
+ * Shared play/pause flag. `revision` increases on every accepted change, so
+ * clients can tell a new command apart from an unchanged snapshot.
+ */
+export const PlaybackStateSchema = z.strictObject({
+  status: PlaybackStatusSchema,
+  revision: z.number().int().nonnegative(),
+});
+
 /** Complete description of a room at one moment. Participants are in join order. */
 export const RoomSnapshotSchema = z
   .strictObject({
@@ -71,6 +82,7 @@ export const RoomSnapshotSchema = z
     hostId: ParticipantIdSchema,
     participants: z.array(ParticipantSchema),
     media: SharedMediaSchema.nullable(),
+    playback: PlaybackStateSchema,
   })
   .refine(
     (snapshot) =>
@@ -100,10 +112,18 @@ export const MediaSetMessageSchema = z.strictObject({
   media: SharedMediaSchema,
 });
 
+/** Any participant: play or pause the room's media. */
+export const PlaybackSetMessageSchema = z.strictObject({
+  type: z.literal("playback.set"),
+  protocolVersion: z.literal(ProtocolVersion),
+  status: PlaybackStatusSchema,
+});
+
 export const ClientMessageSchema = z.discriminatedUnion("type", [
   RoomCreateMessageSchema,
   RoomJoinMessageSchema,
   MediaSetMessageSchema,
+  PlaybackSetMessageSchema,
 ]);
 
 // Server → client
@@ -116,6 +136,7 @@ export const ErrorCodeSchema = z.enum([
   "already_in_room",
   "not_in_room",
   "not_host",
+  "no_media",
   "internal_error",
 ]);
 
@@ -126,7 +147,7 @@ export const RoomJoinedMessageSchema = z.strictObject({
   snapshot: RoomSnapshotSchema,
 });
 
-/** Sent whenever room membership, host, or shared media changes. */
+/** Sent whenever room membership, host, shared media, or playback changes. */
 export const RoomSnapshotMessageSchema = z.strictObject({
   type: z.literal("room.snapshot"),
   snapshot: RoomSnapshotSchema,
@@ -148,6 +169,8 @@ export type RoomId = z.infer<typeof RoomIdSchema>;
 export type ParticipantId = z.infer<typeof ParticipantIdSchema>;
 export type Participant = z.infer<typeof ParticipantSchema>;
 export type SharedMedia = z.infer<typeof SharedMediaSchema>;
+export type PlaybackStatus = z.infer<typeof PlaybackStatusSchema>;
+export type PlaybackState = z.infer<typeof PlaybackStateSchema>;
 export type RoomSnapshot = z.infer<typeof RoomSnapshotSchema>;
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;

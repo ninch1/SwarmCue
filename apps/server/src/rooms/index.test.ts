@@ -26,6 +26,14 @@ function createTestStore(options: {
   });
 }
 
+const initialPlayback = { status: "paused", revision: 0 } as const;
+
+const media = {
+  magnetUri: "magnet:?xt=urn:btih:c9e15763f722f23e98a29decdfae341b98d53056",
+  name: "movie.mp4",
+  sizeBytes: 1024,
+};
+
 describe("createRoomStore", () => {
   it("creates a room containing only the creator, who is host", () => {
     const store = createTestStore();
@@ -38,6 +46,7 @@ describe("createRoomStore", () => {
       hostId: "p1",
       participants: [{ id: "p1", displayName: "Ada" }],
       media: null,
+      playback: initialPlayback,
     });
   });
 
@@ -58,6 +67,7 @@ describe("createRoomStore", () => {
           { id: "p2", displayName: "Grace" },
         ],
         media: null,
+        playback: initialPlayback,
       },
     });
     expect(store.getSnapshot("AAAAAAAA")).toEqual(
@@ -96,6 +106,7 @@ describe("createRoomStore", () => {
       hostId: "p1",
       participants: [{ id: "p1", displayName: "Ada" }],
       media: null,
+      playback: initialPlayback,
     });
   });
 
@@ -113,6 +124,7 @@ describe("createRoomStore", () => {
         { id: "p3", displayName: "Linus" },
       ],
       media: null,
+      playback: initialPlayback,
     });
   });
 
@@ -148,12 +160,6 @@ describe("createRoomStore", () => {
 });
 
 describe("setMedia", () => {
-  const media = {
-    magnetUri: "magnet:?xt=urn:btih:c9e15763f722f23e98a29decdfae341b98d53056",
-    name: "movie.mp4",
-    sizeBytes: 1024,
-  };
-
   it("lets the host set media and returns the updated snapshot", () => {
     const store = createTestStore();
     const { snapshot } = store.createRoom("Ada");
@@ -171,6 +177,7 @@ describe("setMedia", () => {
           { id: "p2", displayName: "Grace" },
         ],
         media,
+        playback: { status: "paused", revision: 1 },
       },
     });
     expect(store.getSnapshot(snapshot.roomId)?.media).toEqual(media);
@@ -223,6 +230,91 @@ describe("setMedia", () => {
     }
 
     expect(store.getSnapshot(snapshot.roomId)?.media).toEqual(media);
+  });
+});
+
+describe("setPlayback", () => {
+  function roomWithMedia() {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada");
+    store.joinRoom(snapshot.roomId, "Grace");
+    store.setMedia(snapshot.roomId, "p1", media);
+    return { store, roomId: snapshot.roomId };
+  }
+
+  it("lets any participant play and pause, bumping the revision each time", () => {
+    const { store, roomId } = roomWithMedia();
+
+    const played = store.setPlayback(roomId, "p2", "playing");
+    expect(played).toMatchObject({
+      ok: true,
+      changed: true,
+      snapshot: { playback: { status: "playing", revision: 2 } },
+    });
+
+    const paused = store.setPlayback(roomId, "p1", "paused");
+    expect(paused).toMatchObject({
+      ok: true,
+      changed: true,
+      snapshot: { playback: { status: "paused", revision: 3 } },
+    });
+  });
+
+  it("reports no change and keeps the revision when the status is already in effect", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setPlayback(roomId, "p1", "playing");
+
+    expect(store.setPlayback(roomId, "p2", "playing")).toMatchObject({
+      ok: true,
+      changed: false,
+      snapshot: { playback: { status: "playing", revision: 2 } },
+    });
+  });
+
+  it("rejects playback before any media is shared", () => {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada");
+
+    expect(store.setPlayback(snapshot.roomId, "p1", "playing")).toEqual({
+      ok: false,
+      error: "no_media",
+    });
+    expect(store.getSnapshot(snapshot.roomId)?.playback).toEqual(initialPlayback);
+  });
+
+  it("rejects unknown rooms and non-members", () => {
+    const { store, roomId } = roomWithMedia();
+
+    expect(store.setPlayback("ZZZZZZZZ", "p1", "playing")).toEqual({
+      ok: false,
+      error: "room_not_found",
+    });
+    expect(store.setPlayback(roomId, "intruder", "playing")).toEqual({
+      ok: false,
+      error: "not_in_room",
+    });
+  });
+
+  it("resets to paused with a new revision when the host changes media", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setPlayback(roomId, "p2", "playing");
+
+    const result = store.setMedia(roomId, "p1", { ...media, name: "other.mp4" });
+
+    expect(result.ok && result.snapshot.playback).toEqual({
+      status: "paused",
+      revision: 3,
+    });
+  });
+
+  it("keeps the playback state when the host leaves", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setPlayback(roomId, "p1", "playing");
+
+    expect(store.leaveRoom(roomId, "p1")?.playback).toEqual({
+      status: "playing",
+      revision: 2,
+    });
   });
 });
 

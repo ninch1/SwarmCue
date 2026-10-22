@@ -14,10 +14,15 @@ type Session = {
   participantId: ParticipantId;
 };
 
-const ERROR_TEXT: Record<"room_not_found" | "room_full" | "not_host", string> = {
+const ERROR_TEXT: Record<
+  "room_not_found" | "room_full" | "not_host" | "not_in_room" | "no_media",
+  string
+> = {
   room_not_found: "No room exists with that code.",
   room_full: "That room is full.",
   not_host: "Only the host can change the media.",
+  not_in_room: "Join a room first.",
+  no_media: "Nothing is playing yet.",
 };
 
 function rawDataToString(data: RawData): string {
@@ -141,6 +146,27 @@ export function attachRealtime(wss: WebSocketServer, rooms: RoomStore): void {
             return;
           }
           broadcastSnapshot(result.snapshot);
+          return;
+        }
+        case "playback.set": {
+          if (!session) {
+            sendError(socket, "not_in_room", ERROR_TEXT.not_in_room);
+            return;
+          }
+          const result = rooms.setPlayback(
+            session.roomId,
+            session.participantId,
+            message.status,
+          );
+          if (!result.ok) {
+            sendError(socket, result.error, ERROR_TEXT[result.error]);
+            return;
+          }
+          // An unchanged status is not re-broadcast, so clients echoing the
+          // state they just applied cannot cause message loops.
+          if (result.changed) {
+            broadcastSnapshot(result.snapshot);
+          }
           return;
         }
       }
