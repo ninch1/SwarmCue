@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CLOCK_PING_ID_MAX,
   ProtocolVersion,
   ServerMessageSchema,
   parseClientMessage,
@@ -186,6 +187,74 @@ describe("playback.set", () => {
     if (!result.ok) {
       expect(result.code).toBe("invalid_message");
     }
+  });
+});
+
+describe("clock.ping", () => {
+  function clockPing(fields: Record<string, unknown>) {
+    return { type: "clock.ping", protocolVersion: ProtocolVersion, ...fields };
+  }
+
+  it.each([0, 7, CLOCK_PING_ID_MAX])("accepts id %s", (id) => {
+    expect(parseClientMessage(clockPing({ id }))).toEqual({
+      ok: true,
+      message: { type: "clock.ping", protocolVersion: ProtocolVersion, id },
+    });
+  });
+
+  it.each([
+    ["missing id", {}],
+    ["non-integer id", { id: 1.5 }],
+    ["string id", { id: "1" }],
+    ["negative id", { id: -1 }],
+    ["out-of-range id", { id: CLOCK_PING_ID_MAX + 1 }],
+    ["client timestamp", { id: 1, clientTimeMs: 1_700_000_000_000 }],
+  ])("rejects %s", (_label, fields) => {
+    const result = parseClientMessage(clockPing(fields));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("invalid_message");
+    }
+  });
+
+  it("rejects a missing protocol version", () => {
+    const result = parseClientMessage({ type: "clock.ping", id: 1 });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("invalid_message");
+    }
+  });
+
+  it("reports a different protocol version as unsupported_version", () => {
+    const result = parseClientMessage(clockPing({ id: 1, protocolVersion: 999 }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("unsupported_version");
+    }
+  });
+});
+
+describe("clock.pong", () => {
+  it("accepts a valid pong", () => {
+    expect(
+      ServerMessageSchema.safeParse({
+        type: "clock.pong",
+        id: 3,
+        serverTimeMs: 1_700_000_000_000,
+      }).success,
+    ).toBe(true);
+  });
+
+  it.each([
+    ["negative server time", { id: 3, serverTimeMs: -1 }],
+    ["fractional server time", { id: 3, serverTimeMs: 1.5 }],
+    ["missing server time", { id: 3 }],
+    ["missing id", { serverTimeMs: 1 }],
+    ["extra keys", { id: 3, serverTimeMs: 1, clientTimeMs: 1 }],
+  ])("rejects %s", (_label, fields) => {
+    expect(
+      ServerMessageSchema.safeParse({ type: "clock.pong", ...fields }).success,
+    ).toBe(false);
   });
 });
 

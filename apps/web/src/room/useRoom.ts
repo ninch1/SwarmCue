@@ -8,6 +8,7 @@ import {
   type SharedMedia,
 } from "@swarmcue/protocol";
 import { useEffect, useRef, useState } from "react";
+import { startClockSync, type ClockSync } from "../clock/clockSync.js";
 import { openRoomConnection, type RoomConnection } from "./connection.js";
 import { normalizeRoomCode } from "./roomCode.js";
 
@@ -37,6 +38,11 @@ export type UseRoom = {
    * the command cannot be sent, otherwise null.
    */
   setPlayback: (status: PlaybackStatus) => string | null;
+  /**
+   * Estimated current server time in epoch ms, or null before the current
+   * connection has measured the clock. Local-only; never sent as room state.
+   */
+  estimateServerNowMs: () => number | null;
 };
 
 /** Returns the validated message, or the first validation message as a string. */
@@ -60,16 +66,38 @@ export function useRoom(): UseRoom {
   const connectionRef = useRef<RoomConnection | null>(null);
   /** The connection that has completed create/join; null while connecting or idle. */
   const joinedConnectionRef = useRef<RoomConnection | null>(null);
+  /** Clock estimation for the current connection; a new connection starts fresh. */
+  const clockRef = useRef<ClockSync | null>(null);
+
+  function disposeClock(): void {
+    clockRef.current?.dispose();
+    clockRef.current = null;
+  }
 
   useEffect(() => {
     return () => {
+      disposeClock();
       const connection = connectionRef.current;
       connectionRef.current = null;
       connection?.close();
     };
   }, []);
 
+  // Timers may be throttled or the clock paused while hidden; re-measure on return.
+  useEffect(() => {
+    function handleVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        clockRef.current?.resyncNow();
+      }
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, []);
+
   function closeCurrent(): void {
+    disposeClock();
     const connection = connectionRef.current;
     connectionRef.current = null;
     joinedConnectionRef.current = null;
@@ -91,12 +119,24 @@ export function useRoom(): UseRoom {
     const connection = openRoomConnection({
       onOpen: () => {
         connection.send(firstMessage);
+        if (connectionRef.current !== connection) {
+          return;
+        }
+        disposeClock();
+        clockRef.current = startClockSync({
+          sendPing: (id) => {
+            connection.send({ type: "clock.ping", protocolVersion: ProtocolVersion, id });
+          },
+        });
       },
       onMessage: (message) => {
         if (connectionRef.current !== connection) {
           return;
         }
         switch (message.type) {
+          case "clock.pong":
+            clockRef.current?.handlePong(message);
+            return;
           case "room.joined":
             joined = true;
             joinedConnectionRef.current = connection;
@@ -133,6 +173,7 @@ export function useRoom(): UseRoom {
         if (connectionRef.current !== connection) {
           return;
         }
+        disposeClock();
         connectionRef.current = null;
         joinedConnectionRef.current = null;
         setState({
@@ -194,5 +235,6 @@ export function useRoom(): UseRoom {
       connection.send(message);
       return null;
     },
+    estimateServerNowMs: () => clockRef.current?.estimateServerNowMs() ?? null,
   };
 }

@@ -10,6 +10,11 @@ import { WebSocket } from "ws";
 import { createCoordinationServer, type CoordinationServer } from "../server.js";
 
 const MESSAGE_TIMEOUT_MS = 2000;
+const SERVER_NOW_MS = 1_700_000_000_000;
+
+function clockPing(id: number) {
+  return { type: "clock.ping", protocolVersion: ProtocolVersion, id };
+}
 
 const media = {
   magnetUri: "magnet:?xt=urn:btih:c9e15763f722f23e98a29decdfae341b98d53056&dn=movie.mp4",
@@ -129,7 +134,7 @@ describe("realtime rooms", () => {
   }
 
   beforeEach(async () => {
-    coordination = createCoordinationServer();
+    coordination = createCoordinationServer({ now: () => SERVER_NOW_MS });
     coordination.server.listen(0, "127.0.0.1");
     await once(coordination.server, "listening");
     const { port } = coordination.server.address() as AddressInfo;
@@ -388,6 +393,49 @@ describe("realtime rooms", () => {
     });
 
     expect(await grace.next()).toMatchObject({ type: "error", code: "room_not_found" });
+  });
+
+  it("answers a clock ping before joining a room", async () => {
+    const ada = await client();
+
+    ada.send(clockPing(42));
+
+    expect(await ada.next()).toEqual({
+      type: "clock.pong",
+      id: 42,
+      serverTimeMs: SERVER_NOW_MS,
+    });
+  });
+
+  it("answers clock pings inside a room without broadcasting", async () => {
+    const { host, viewer } = await hostAndViewer();
+
+    host.send(clockPing(1));
+    expect(await host.next()).toEqual({
+      type: "clock.pong",
+      id: 1,
+      serverTimeMs: SERVER_NOW_MS,
+    });
+
+    // If the ping had reached the viewer, it would arrive before this snapshot.
+    host.send(mediaSet(media));
+    expect(await viewer.next()).toMatchObject({
+      type: "room.snapshot",
+      snapshot: { media },
+    });
+  });
+
+  it("rejects a malformed clock ping and keeps the connection usable", async () => {
+    const ada = await client();
+
+    ada.send({ type: "clock.ping", protocolVersion: ProtocolVersion, id: -1 });
+    expect(await ada.next()).toMatchObject({ type: "error", code: "invalid_message" });
+
+    ada.send({ ...clockPing(2), clientTimeMs: 123 });
+    expect(await ada.next()).toMatchObject({ type: "error", code: "invalid_message" });
+
+    ada.send(clockPing(3));
+    expect(await ada.next()).toMatchObject({ type: "clock.pong", id: 3 });
   });
 
   it("rejects creating a second room on the same connection", async () => {

@@ -11,6 +11,7 @@ export const ROOM_ID_LENGTH = 8;
 export const DISPLAY_NAME_MAX_LENGTH = 32;
 export const MAGNET_URI_MAX_LENGTH = 2048;
 export const MEDIA_NAME_MAX_LENGTH = 255;
+export const CLOCK_PING_ID_MAX = 2_147_483_647;
 
 const NO_CONTROL_CHARACTERS = /^\P{Cc}+$/u;
 
@@ -90,7 +91,21 @@ export const RoomSnapshotSchema = z
     { message: "The host must be one of the participants.", path: ["hostId"] },
   );
 
+/** Matches a clock.pong to the client's pending sample. */
+export const ClockPingIdSchema = z.number().int().min(0).max(CLOCK_PING_ID_MAX);
+
 // Client → server
+
+/**
+ * Any connection, in a room or not: ask for the server clock. Browser
+ * JavaScript cannot use native WebSocket ping/pong frames, so this is an
+ * ordinary protocol message.
+ */
+export const ClockPingMessageSchema = z.strictObject({
+  type: z.literal("clock.ping"),
+  protocolVersion: z.literal(ProtocolVersion),
+  id: ClockPingIdSchema,
+});
 
 export const RoomCreateMessageSchema = z.strictObject({
   type: z.literal("room.create"),
@@ -120,6 +135,7 @@ export const PlaybackSetMessageSchema = z.strictObject({
 });
 
 export const ClientMessageSchema = z.discriminatedUnion("type", [
+  ClockPingMessageSchema,
   RoomCreateMessageSchema,
   RoomJoinMessageSchema,
   MediaSetMessageSchema,
@@ -159,10 +175,18 @@ export const ErrorMessageSchema = z.strictObject({
   message: z.string(),
 });
 
+/** Reply to clock.ping. `serverTimeMs` is the server's Date.now() when replying. */
+export const ClockPongMessageSchema = z.strictObject({
+  type: z.literal("clock.pong"),
+  id: ClockPingIdSchema,
+  serverTimeMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+});
+
 export const ServerMessageSchema = z.discriminatedUnion("type", [
   RoomJoinedMessageSchema,
   RoomSnapshotMessageSchema,
   ErrorMessageSchema,
+  ClockPongMessageSchema,
 ]);
 
 export type RoomId = z.infer<typeof RoomIdSchema>;
@@ -175,6 +199,8 @@ export type RoomSnapshot = z.infer<typeof RoomSnapshotSchema>;
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;
 export type ErrorCode = z.infer<typeof ErrorCodeSchema>;
+export type ClockPingMessage = z.infer<typeof ClockPingMessageSchema>;
+export type ClockPongMessage = z.infer<typeof ClockPongMessageSchema>;
 
 export type ClientMessageParseResult =
   | { ok: true; message: ClientMessage }

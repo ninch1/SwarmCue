@@ -15,7 +15,14 @@ export type CoordinationServer = {
   wss: WebSocketServer;
 };
 
-export function createCoordinationServer(): CoordinationServer {
+export type CoordinationServerOptions = {
+  /** Server clock in epoch ms; injectable so tests can assert exact times. */
+  now?: () => number;
+};
+
+export function createCoordinationServer({
+  now = Date.now,
+}: CoordinationServerOptions = {}): CoordinationServer {
   // Express handles HTTP. A shared Node HTTP server is still required so `ws`
   // can attach to the same port (do not call app.listen()).
   const server = createServer(createHttpApp());
@@ -30,7 +37,7 @@ export function createCoordinationServer(): CoordinationServer {
     generateParticipantId,
     maxParticipants: MAX_PARTICIPANTS,
   });
-  attachRealtime(wss, rooms);
+  attachRealtime(wss, rooms, { now });
 
   return { server, wss };
 }

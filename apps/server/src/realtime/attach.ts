@@ -35,12 +35,21 @@ function rawDataToString(data: RawData): string {
   return data.toString("utf8");
 }
 
+export type RealtimeOptions = {
+  /** Authoritative server clock (epoch ms) reported in clock.pong. */
+  now: () => number;
+};
+
 /**
  * Translates WebSocket traffic into room-domain operations. Messages larger
  * than the server's `maxPayload` are rejected by `ws` itself, which closes
  * the connection.
  */
-export function attachRealtime(wss: WebSocketServer, rooms: RoomStore): void {
+export function attachRealtime(
+  wss: WebSocketServer,
+  rooms: RoomStore,
+  { now }: RealtimeOptions,
+): void {
   const socketsByRoom = new Map<RoomId, Set<WebSocket>>();
 
   function send(socket: WebSocket, message: ServerMessage): void {
@@ -108,6 +117,12 @@ export function attachRealtime(wss: WebSocketServer, rooms: RoomStore): void {
 
       const message = parsed.message;
       switch (message.type) {
+        case "clock.ping": {
+          // Needs no room session; answer immediately so the client's
+          // round-trip measurement includes as little server time as possible.
+          send(socket, { type: "clock.pong", id: message.id, serverTimeMs: now() });
+          return;
+        }
         case "room.create": {
           if (session) {
             sendAlreadyInRoom();

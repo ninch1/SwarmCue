@@ -169,6 +169,15 @@ Playback commands are processed by the server before becoming shared room state.
 
 This model means the server does **not** need to broadcast a timestamp every second. Clients can calculate where playback should currently be.
 
+### Clock estimation
+
+The server's `Date.now()` is the authoritative, transferable clock. Each client estimates it locally so it can later interpret server timestamps; the estimate never changes room state.
+
+- Browser JavaScript cannot use native WebSocket ping/pong frames, so clients send an application message `clock.ping { protocolVersion, id }`. The server replies immediately with `clock.pong { id, serverTimeMs }`, where `serverTimeMs` is its own clock. The server never trusts or echoes a client timestamp. Pings are allowed before and after joining a room.
+- For each sample, the client measures the round trip with `performance.now()`, assumes the server replied halfway through it, and stores the offset between its monotonic clock and server time: `offset = serverTimeMs - (sentAt + roundTrip / 2)`. Estimated server time is `performance.now() + offset`. Anchoring to the monotonic clock means client wall-clock changes (manual edits, resync after sleep) cannot corrupt the estimate.
+- A measurement round sends 5 pings, one at a time, with a 2 s timeout each. The sample with the lowest round trip wins, because it has the least room for asymmetric-delay error (at most half the round trip). Unknown, duplicate, and late pongs are ignored. A round without valid samples keeps the previous estimate.
+- Clients re-measure every 45 s and when the tab becomes visible again. Each WebSocket connection starts a fresh estimate. Clock failures are logged and never disconnect the room.
+
 ### V1 first step: shared play/pause flag
 
 The first implemented step shares only a `playing`/`paused` status plus a revision number that increases on every accepted change. Clients apply the room status when the revision changes or when a new video element loads, and report their own play/pause actions as commands. Positions are not shared yet: each client plays or pauses at its own current time. The position and drift model above comes later.
