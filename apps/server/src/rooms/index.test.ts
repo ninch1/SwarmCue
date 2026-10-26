@@ -1,7 +1,15 @@
 import { RoomIdSchema } from "@swarmcue/protocol";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { generateRoomId } from "./ids.js";
 import { createRoomStore } from "./index.js";
+
+const START_MS = 1_700_000_000_000;
+/** Server clock shared by every test store; reset before each test. */
+const clock = { nowMs: START_MS };
+
+beforeEach(() => {
+  clock.nowMs = START_MS;
+});
 
 function createTestStore(options: {
   roomIds?: string[];
@@ -23,10 +31,16 @@ function createTestStore(options: {
       return `p${participantCount}`;
     },
     maxParticipants: options.maxParticipants ?? 5,
+    now: () => clock.nowMs,
   });
 }
 
-const initialPlayback = { status: "paused", revision: 0 } as const;
+const initialPlayback = {
+  status: "paused",
+  positionSeconds: 0,
+  updatedAtServerMs: START_MS,
+  revision: 0,
+} as const;
 
 const media = {
   magnetUri: "magnet:?xt=urn:btih:c9e15763f722f23e98a29decdfae341b98d53056",
@@ -177,7 +191,7 @@ describe("setMedia", () => {
           { id: "p2", displayName: "Grace" },
         ],
         media,
-        playback: { status: "paused", revision: 1 },
+        playback: { ...initialPlayback, revision: 1 },
       },
     });
     expect(store.getSnapshot(snapshot.roomId)?.media).toEqual(media);
@@ -242,32 +256,80 @@ describe("setPlayback", () => {
     return { store, roomId: snapshot.roomId };
   }
 
-  it("lets any participant play and pause, bumping the revision each time", () => {
+  const play = (positionSeconds: number) =>
+    ({ status: "playing", positionSeconds }) as const;
+  const pause = (positionSeconds: number) =>
+    ({ status: "paused", positionSeconds }) as const;
+
+  it("lets any participant play, pause, and seek, timestamping each change", () => {
     const { store, roomId } = roomWithMedia();
 
-    const played = store.setPlayback(roomId, "p2", "playing");
-    expect(played).toMatchObject({
+    expect(store.setPlayback(roomId, "p2", play(0))).toMatchObject({
       ok: true,
       changed: true,
-      snapshot: { playback: { status: "playing", revision: 2 } },
+      snapshot: {
+        playback: {
+          status: "playing",
+          positionSeconds: 0,
+          updatedAtServerMs: START_MS,
+          revision: 2,
+        },
+      },
     });
 
-    const paused = store.setPlayback(roomId, "p1", "paused");
-    expect(paused).toMatchObject({
+    clock.nowMs += 5000;
+    expect(store.setPlayback(roomId, "p1", pause(5))).toMatchObject({
       ok: true,
       changed: true,
-      snapshot: { playback: { status: "paused", revision: 3 } },
+      snapshot: {
+        playback: {
+          status: "paused",
+          positionSeconds: 5,
+          updatedAtServerMs: START_MS + 5000,
+          revision: 3,
+        },
+      },
+    });
+
+    clock.nowMs += 1000;
+    expect(store.setPlayback(roomId, "p2", pause(60))).toMatchObject({
+      ok: true,
+      changed: true,
+      snapshot: {
+        playback: {
+          status: "paused",
+          positionSeconds: 60,
+          updatedAtServerMs: START_MS + 6000,
+          revision: 4,
+        },
+      },
     });
   });
 
-  it("reports no change and keeps the revision when the status is already in effect", () => {
+  it("reports no change for a request that matches the current timeline", () => {
     const { store, roomId } = roomWithMedia();
-    store.setPlayback(roomId, "p1", "playing");
+    store.setPlayback(roomId, "p1", play(0));
+    clock.nowMs += 2000;
 
-    expect(store.setPlayback(roomId, "p2", "playing")).toMatchObject({
+    // Expected position is now 2 s; 2.1 s is within the tolerance.
+    expect(store.setPlayback(roomId, "p2", play(2.1))).toMatchObject({
       ok: true,
       changed: false,
-      snapshot: { playback: { status: "playing", revision: 2 } },
+      snapshot: {
+        playback: { status: "playing", positionSeconds: 0, updatedAtServerMs: START_MS, revision: 2 },
+      },
+    });
+  });
+
+  it("treats a seek while playing as a change", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setPlayback(roomId, "p1", play(0));
+    clock.nowMs += 2000;
+
+    expect(store.setPlayback(roomId, "p2", play(30))).toMatchObject({
+      ok: true,
+      changed: true,
+      snapshot: { playback: { status: "playing", positionSeconds: 30, revision: 3 } },
     });
   });
 
@@ -275,7 +337,7 @@ describe("setPlayback", () => {
     const store = createTestStore();
     const { snapshot } = store.createRoom("Ada");
 
-    expect(store.setPlayback(snapshot.roomId, "p1", "playing")).toEqual({
+    expect(store.setPlayback(snapshot.roomId, "p1", play(0))).toEqual({
       ok: false,
       error: "no_media",
     });
@@ -285,34 +347,39 @@ describe("setPlayback", () => {
   it("rejects unknown rooms and non-members", () => {
     const { store, roomId } = roomWithMedia();
 
-    expect(store.setPlayback("ZZZZZZZZ", "p1", "playing")).toEqual({
+    expect(store.setPlayback("ZZZZZZZZ", "p1", play(0))).toEqual({
       ok: false,
       error: "room_not_found",
     });
-    expect(store.setPlayback(roomId, "intruder", "playing")).toEqual({
+    expect(store.setPlayback(roomId, "intruder", play(0))).toEqual({
       ok: false,
       error: "not_in_room",
     });
   });
 
-  it("resets to paused with a new revision when the host changes media", () => {
+  it("resets to paused at 0 with a new revision when the host changes media", () => {
     const { store, roomId } = roomWithMedia();
-    store.setPlayback(roomId, "p2", "playing");
+    store.setPlayback(roomId, "p2", play(40));
+    clock.nowMs += 3000;
 
     const result = store.setMedia(roomId, "p1", { ...media, name: "other.mp4" });
 
     expect(result.ok && result.snapshot.playback).toEqual({
       status: "paused",
+      positionSeconds: 0,
+      updatedAtServerMs: START_MS + 3000,
       revision: 3,
     });
   });
 
   it("keeps the playback state when the host leaves", () => {
     const { store, roomId } = roomWithMedia();
-    store.setPlayback(roomId, "p1", "playing");
+    store.setPlayback(roomId, "p1", play(12));
 
     expect(store.leaveRoom(roomId, "p1")?.playback).toEqual({
       status: "playing",
+      positionSeconds: 12,
+      updatedAtServerMs: START_MS,
       revision: 2,
     });
   });

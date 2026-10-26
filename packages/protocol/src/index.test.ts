@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CLOCK_PING_ID_MAX,
+  POSITION_SECONDS_MAX,
   ProtocolVersion,
   ServerMessageSchema,
   parseClientMessage,
@@ -163,20 +164,31 @@ describe("media.set", () => {
 });
 
 describe("playback.set", () => {
-  it.each(["playing", "paused"])("accepts %s", (status) => {
+  it.each([
+    ["playing", 0],
+    ["paused", 12.75],
+    ["playing", POSITION_SECONDS_MAX],
+  ])("accepts %s at %s seconds", (status, positionSeconds) => {
     expect(
       parseClientMessage({
         type: "playback.set",
         protocolVersion: ProtocolVersion,
         status,
+        positionSeconds,
       }).ok,
     ).toBe(true);
   });
 
   it.each([
-    ["unknown status", { status: "stopped" }],
-    ["missing status", {}],
-    ["extra keys", { status: "playing", positionSec: 10 }],
+    ["unknown status", { status: "stopped", positionSeconds: 0 }],
+    ["missing status", { positionSeconds: 0 }],
+    ["missing position", { status: "playing" }],
+    ["negative position", { status: "playing", positionSeconds: -1 }],
+    ["infinite position", { status: "playing", positionSeconds: Infinity }],
+    ["position above the max", { status: "playing", positionSeconds: POSITION_SECONDS_MAX + 1 }],
+    ["string position", { status: "playing", positionSeconds: "10" }],
+    ["client timestamp", { status: "playing", positionSeconds: 1, updatedAtServerMs: 1 }],
+    ["extra keys", { status: "playing", positionSeconds: 1, revision: 3 }],
   ])("rejects %s", (_label, fields) => {
     const result = parseClientMessage({
       type: "playback.set",
@@ -259,7 +271,25 @@ describe("clock.pong", () => {
 });
 
 describe("ServerMessageSchema", () => {
-  const pausedPlayback = { status: "paused", revision: 0 };
+  const pausedPlayback = {
+    status: "paused",
+    positionSeconds: 0,
+    updatedAtServerMs: 1_700_000_000_000,
+    revision: 0,
+  };
+
+  function snapshotWithPlayback(playback: unknown) {
+    return {
+      type: "room.snapshot",
+      snapshot: {
+        roomId: validRoomId,
+        hostId: "p1",
+        participants: [{ id: "p1", displayName: "Ada" }],
+        media: null,
+        playback,
+      },
+    };
+  }
 
   it("accepts a room.joined message", () => {
     const result = ServerMessageSchema.safeParse({
@@ -270,11 +300,23 @@ describe("ServerMessageSchema", () => {
         hostId: "p1",
         participants: [{ id: "p1", displayName: "Ada" }],
         media: { magnetUri: validMagnet, name: "movie.mp4", sizeBytes: 1024 },
-        playback: { status: "playing", revision: 3 },
+        playback: { ...pausedPlayback, status: "playing", positionSeconds: 42.5, revision: 3 },
       },
     });
 
     expect(result.success).toBe(true);
+  });
+
+  it.each([
+    ["missing position", { status: "paused", updatedAtServerMs: 1, revision: 0 }],
+    ["missing server timestamp", { status: "paused", positionSeconds: 0, revision: 0 }],
+    ["negative position", { ...pausedPlayback, positionSeconds: -1 }],
+    ["fractional server timestamp", { ...pausedPlayback, updatedAtServerMs: 1.5 }],
+    ["extra keys", { ...pausedPlayback, playbackRate: 1 }],
+  ])("rejects playback state with %s", (_label, playback) => {
+    expect(ServerMessageSchema.safeParse(snapshotWithPlayback(playback)).success).toBe(
+      false,
+    );
   });
 
   it("rejects a snapshot without playback state", () => {
@@ -299,7 +341,7 @@ describe("ServerMessageSchema", () => {
         hostId: "p1",
         participants: [{ id: "p1", displayName: "Ada" }],
         media: null,
-        playback: { status: "paused", revision: -1 },
+        playback: { ...pausedPlayback, revision: -1 },
       },
     });
 

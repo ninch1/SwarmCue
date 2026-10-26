@@ -168,17 +168,16 @@ export function attachRealtime(
             sendError(socket, "not_in_room", ERROR_TEXT.not_in_room);
             return;
           }
-          const result = rooms.setPlayback(
-            session.roomId,
-            session.participantId,
-            message.status,
-          );
+          const result = rooms.setPlayback(session.roomId, session.participantId, {
+            status: message.status,
+            positionSeconds: message.positionSeconds,
+          });
           if (!result.ok) {
             sendError(socket, result.error, ERROR_TEXT[result.error]);
             return;
           }
-          // An unchanged status is not re-broadcast, so clients echoing the
-          // state they just applied cannot cause message loops.
+          // A request matching the current timeline is not re-broadcast, so
+          // clients echoing the state they just applied cannot cause loops.
           if (result.changed) {
             broadcastSnapshot(result.snapshot);
           }

@@ -9,6 +9,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@swarmcue/playback-sync": "workspace:*",
     "@swarmcue/protocol": "workspace:*",
     "express": "^5.3.0",
     "ws": "^8.18.3"

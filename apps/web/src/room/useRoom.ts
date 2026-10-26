@@ -34,10 +34,11 @@ export type UseRoom = {
    */
   setMedia: (media: SharedMedia) => string | null;
   /**
-   * Any participant: play or pause the room's media. Returns a message when
-   * the command cannot be sent, otherwise null.
+   * Any participant: play, pause, or seek the room's media, reporting this
+   * client's current position. Returns a message when the command cannot be
+   * sent, otherwise null.
    */
-  setPlayback: (status: PlaybackStatus) => string | null;
+  setPlayback: (status: PlaybackStatus, positionSeconds: number) => string | null;
   /**
    * Estimated current server time in epoch ms, or null before the current
    * connection has measured the clock. Local-only; never sent as room state.
@@ -220,13 +221,13 @@ export function useRoom(): UseRoom {
       connection.send(message);
       return null;
     },
-    setPlayback: (status) => {
+    setPlayback: (status, positionSeconds) => {
       const connection = joinedConnectionRef.current;
       if (!connection) {
         return "Join a room before controlling playback.";
       }
       const message = validateClientMessage(
-        { type: "playback.set", protocolVersion: ProtocolVersion, status },
+        { type: "playback.set", protocolVersion: ProtocolVersion, status, positionSeconds },
         "Invalid playback command.",
       );
       if (typeof message === "string") {

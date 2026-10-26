@@ -178,13 +178,18 @@ The server's `Date.now()` is the authoritative, transferable clock. Each client 
 - A measurement round sends 5 pings, one at a time, with a 2 s timeout each. The sample with the lowest round trip wins, because it has the least room for asymmetric-delay error (at most half the round trip). Unknown, duplicate, and late pongs are ignored. A round without valid samples keeps the previous estimate.
 - Clients re-measure every 45 s and when the tab becomes visible again. Each WebSocket connection starts a fresh estimate. Clock failures are logged and never disconnect the room.
 
-### V1 first step: shared play/pause flag
+### V1 position sync
 
-The first implemented step shares only a `playing`/`paused` status plus a revision number that increases on every accepted change. Clients apply the room status when the revision changes or when a new video element loads, and report their own play/pause actions as commands. Positions are not shared yet: each client plays or pauses at its own current time. The position and drift model above comes later.
+The room's playback state is `{ status, positionSeconds, updatedAtServerMs, revision }`. The pure math lives in `packages/playback-sync` and is shared by the server and the client.
+
+- **Commands.** `playback.set { status, positionSeconds }` covers play, pause, and seek: the sender reports its own current position, and a seek is the current status with a new position. The server timestamps each accepted command with its own clock and increments the revision. A request that matches the current timeline (same status, position within 0.25 s of the expected position) is accepted but not re-broadcast, so clients echoing state they just applied cannot cause loops.
+- **Applying room state.** On each new revision, and when a new video element loads its metadata, a client seeks to the expected position if it is more than 0.25 s off, then plays or pauses. Late joiners therefore start where the room is.
+- **Drift correction (seek only).** While the room is playing, each client checks its position every second and seeks to the expected position when it is more than 0.5 s off. Checks are skipped while seeking or buffering, and corrective seeks have a 3 s cooldown. Expected server time comes from clock estimation; until the first estimate, a client uses its own clock.
+- **Local actions.** A user's play, pause, and seek are reported as commands; events caused by applying room state are ignored. A change counts as the user's only when it follows a recent user gesture (`navigator.userActivation.isActive`), because browsers also pause and resume media on their own (for example, Chrome pauses muted playback that started without a gesture when it is offscreen). Browser-initiated pauses stay local, and a browser-initiated resume while the room is paused is reverted. Reaching the end of the media always pauses the room. Pressing play while the room is already playing (for example after the browser blocked autoplay) rejoins the room's position instead of restarting it.
 
 ### Playback control (V1)
 
-- Any participant may play or pause. The server applies commands in arrival order, so the last command wins.
+- Any participant may play, pause, or seek. The server applies commands in arrival order, so the last command wins.
 - Host-only playback control may later become a room setting; controller roles come after V1.
 - New media always resets playback to paused at position 0.
 
@@ -250,7 +255,8 @@ Vitest is the test runner. Specific remaining library choices (for example WebTo
 - Playback is limited to formats and codecs supported by the participant's browser.
 - Shared media stays available only while participants who hold the needed pieces remain connected. If the original host leaves before others have downloaded the file, playback may stall.
 - Host transfer does not guarantee continued media availability.
-- Until position sync exists, participants who join mid-playback start from the beginning, and positions can drift apart.
+- There is no room-wide pause for buffering yet. A participant who is still downloading falls behind and is pulled forward by corrective seeks, which may cause repeated short stalls on slow connections.
+- Drift correction uses seeks only, so a correction is a visible jump rather than a gradual catch-up.
 - Peer discovery depends on available WebTorrent-compatible trackers.
 - Browsers cannot connect to ordinary BitTorrent swarms (TCP/UDP peers, `udp://` trackers), so public torrents are not supported.
 - SwarmCue does not provide server-side transcoding or media fallback.
@@ -267,8 +273,8 @@ Vitest is the test runner. Specific remaining library choices (for example WebTo
 
 The following decisions will be made during implementation and testing:
 
-- Synchronization drift thresholds.
-- Whether minor drift should use temporary playback-rate adjustment.
+- Final synchronization drift thresholds. The current starting values (0.25 s when applying room state, 0.5 s drift with a 3 s cooldown) should be tuned through testing.
+- Whether minor drift should use temporary playback-rate adjustment instead of seeking (V1 currently seeks only).
 - Reconnection and host grace-period durations.
 - Room expiration duration.
 - Shared subtitle distribution method.

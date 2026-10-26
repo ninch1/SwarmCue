@@ -1,6 +1,7 @@
 /**
  * In-memory room domain. This module must not import WebSocket or HTTP types.
  */
+import { isEquivalentPlayback } from "@swarmcue/playback-sync";
 import type {
   Participant,
   ParticipantId,
@@ -15,6 +16,13 @@ export type RoomStoreOptions = {
   generateRoomId: () => RoomId;
   generateParticipantId: () => ParticipantId;
   maxParticipants: number;
+  /** Server clock in epoch ms, used to timestamp playback changes. */
+  now: () => number;
+};
+
+export type PlaybackRequest = {
+  status: PlaybackStatus;
+  positionSeconds: number;
 };
 
 export type JoinRoomError = "room_not_found" | "room_full";
@@ -37,7 +45,7 @@ export type SetMediaResult =
 export type SetPlaybackError = "room_not_found" | "not_in_room" | "no_media";
 
 export type SetPlaybackResult =
-  /** `changed` is false when the requested status was already in effect. */
+  /** `changed` is false when the request matches the current timeline. */
   | { ok: true; changed: boolean; snapshot: RoomSnapshot }
   | { ok: false; error: SetPlaybackError };
 
@@ -79,6 +87,16 @@ export function createRoomStore(options: RoomStoreOptions) {
     return { id: options.generateParticipantId(), displayName };
   }
 
+  /** New rooms and new media start paused at the beginning. */
+  function pausedAtStart(revision: number): PlaybackState {
+    return {
+      status: "paused",
+      positionSeconds: 0,
+      updatedAtServerMs: options.now(),
+      revision,
+    };
+  }
+
   return {
     createRoom(displayName: string): EnteredRoom {
       const participant = newParticipant(displayName);
@@ -87,7 +105,7 @@ export function createRoomStore(options: RoomStoreOptions) {
         hostId: participant.id,
         participants: [participant],
         media: null,
-        playback: { status: "paused", revision: 0 },
+        playback: pausedAtStart(0),
       };
       rooms.set(room.id, room);
       return { participant: { ...participant }, snapshot: toSnapshot(room) };
@@ -137,7 +155,7 @@ export function createRoomStore(options: RoomStoreOptions) {
 
     /**
      * Replace the shared media. Only the current host may do this. New media
-     * always starts paused.
+     * always starts paused at position 0.
      */
     setMedia(
       roomId: RoomId,
@@ -152,18 +170,19 @@ export function createRoomStore(options: RoomStoreOptions) {
         return { ok: false, error: "not_host" };
       }
       room.media = { ...media };
-      room.playback = { status: "paused", revision: room.playback.revision + 1 };
+      room.playback = pausedAtStart(room.playback.revision + 1);
       return { ok: true, snapshot: toSnapshot(room) };
     },
 
     /**
-     * Play or pause the shared media. Any participant may do this in V1; the
-     * server applies commands in arrival order.
+     * Play, pause, or seek the shared media. Any participant may do this in
+     * V1; the server applies commands in arrival order and timestamps the
+     * reported position with its own clock.
      */
     setPlayback(
       roomId: RoomId,
       participantId: ParticipantId,
-      status: PlaybackStatus,
+      request: PlaybackRequest,
     ): SetPlaybackResult {
       const room = rooms.get(roomId);
       if (!room) {
@@ -175,10 +194,17 @@ export function createRoomStore(options: RoomStoreOptions) {
       if (!room.media) {
         return { ok: false, error: "no_media" };
       }
-      if (room.playback.status === status) {
+      const nowMs = options.now();
+      // Clients echoing state they just applied land here, which prevents loops.
+      if (isEquivalentPlayback(room.playback, request, nowMs)) {
         return { ok: true, changed: false, snapshot: toSnapshot(room) };
       }
-      room.playback = { status, revision: room.playback.revision + 1 };
+      room.playback = {
+        status: request.status,
+        positionSeconds: request.positionSeconds,
+        updatedAtServerMs: nowMs,
+        revision: room.playback.revision + 1,
+      };
       return { ok: true, changed: true, snapshot: toSnapshot(room) };
     },
 

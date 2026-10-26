@@ -1,15 +1,20 @@
-import type { PlaybackState, PlaybackStatus } from "@swarmcue/protocol";
+import type { PlaybackState } from "@swarmcue/protocol";
 import { useRef } from "react";
-import { usePlaybackSync } from "../player/usePlaybackSync.js";
+import {
+  usePlaybackSync,
+  type LocalPlaybackChange,
+} from "../player/usePlaybackSync.js";
 
 type VideoPlayerProps = {
   src: string | null;
   /** Shown under "No media loaded" when there is no source. */
   emptyMessage: string;
-  /** The room's play/pause state; null outside a room. */
+  /** The room's playback timeline; null outside a room. */
   playback: PlaybackState | null;
-  /** Called when this user plays or pauses the video. */
-  onLocalPlaybackChange: (status: PlaybackStatus) => void;
+  /** Estimated current server time in epoch ms. */
+  getServerNowMs: () => number;
+  /** Called when this user plays, pauses, or seeks the video. */
+  onLocalPlaybackChange: (change: LocalPlaybackChange) => void;
   onError?: () => void;
 };
 
@@ -17,16 +22,15 @@ export function VideoPlayer({
   src,
   emptyMessage,
   playback,
+  getServerNowMs,
   onLocalPlaybackChange,
   onError,
 }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const { blocked } = usePlaybackSync(
-    videoRef,
-    src,
-    playback,
-    onLocalPlaybackChange,
-  );
+  const { blocked } = usePlaybackSync(videoRef, src, playback, {
+    getServerNowMs,
+    onLocalChange: onLocalPlaybackChange,
+  });
 
   return (
     <div className="flex flex-col gap-2">

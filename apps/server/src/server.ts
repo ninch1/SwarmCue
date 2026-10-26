@@ -36,6 +36,7 @@ export function createCoordinationServer({
     generateRoomId,
     generateParticipantId,
     maxParticipants: MAX_PARTICIPANTS,
+    now,
   });
   attachRealtime(wss, rooms, { now });
 

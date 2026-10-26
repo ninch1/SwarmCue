@@ -11,6 +11,12 @@ import { createCoordinationServer, type CoordinationServer } from "../server.js"
 
 const MESSAGE_TIMEOUT_MS = 2000;
 const SERVER_NOW_MS = 1_700_000_000_000;
+const initialPlayback = {
+  status: "paused",
+  positionSeconds: 0,
+  updatedAtServerMs: SERVER_NOW_MS,
+  revision: 0,
+};
 
 function clockPing(id: number) {
   return { type: "clock.ping", protocolVersion: ProtocolVersion, id };
@@ -26,8 +32,8 @@ function mediaSet(sharedMedia: unknown) {
   return { type: "media.set", protocolVersion: ProtocolVersion, media: sharedMedia };
 }
 
-function playbackSet(status: "playing" | "paused") {
-  return { type: "playback.set", protocolVersion: ProtocolVersion, status };
+function playbackSet(status: "playing" | "paused", positionSeconds = 0) {
+  return { type: "playback.set", protocolVersion: ProtocolVersion, status, positionSeconds };
 }
 
 type TestClient = {
@@ -208,7 +214,7 @@ describe("realtime rooms", () => {
         hostId: created.selfId,
         participants: [{ id: created.selfId, displayName: "Ada" }],
         media: null,
-        playback: { status: "paused", revision: 0 },
+        playback: initialPlayback,
       },
     });
   });
@@ -225,7 +231,7 @@ describe("realtime rooms", () => {
         hostId: viewerId,
         participants: [{ id: viewerId, displayName: "Grace" }],
         media: null,
-        playback: { status: "paused", revision: 0 },
+        playback: initialPlayback,
       },
     });
   });
@@ -327,6 +333,63 @@ describe("realtime rooms", () => {
       type: "room.snapshot",
       snapshot: { playback: { status: "paused" } },
     });
+  });
+
+  it("broadcasts a seek with the reported position and the server's timestamp", async () => {
+    const { host, viewer } = await roomWithMedia();
+    viewer.send(playbackSet("playing", 0));
+    await viewer.next();
+    await host.next();
+
+    host.send(playbackSet("playing", 95.5));
+
+    const seeked = {
+      type: "room.snapshot",
+      snapshot: {
+        playback: {
+          status: "playing",
+          positionSeconds: 95.5,
+          updatedAtServerMs: SERVER_NOW_MS,
+          revision: 3,
+        },
+      },
+    };
+    expect(await host.next()).toMatchObject(seeked);
+    expect(await viewer.next()).toMatchObject(seeked);
+  });
+
+  it("gives a late joiner the current position and its server timestamp", async () => {
+    const { host, viewer, roomId } = await roomWithMedia();
+    host.send(playbackSet("playing", 42));
+    await host.next();
+    await viewer.next();
+
+    const late = await client();
+    late.send({
+      type: "room.join",
+      protocolVersion: ProtocolVersion,
+      roomId,
+      displayName: "Linus",
+    });
+
+    expect(await late.next()).toMatchObject({
+      type: "room.joined",
+      snapshot: {
+        playback: {
+          status: "playing",
+          positionSeconds: 42,
+          updatedAtServerMs: SERVER_NOW_MS,
+        },
+      },
+    });
+  });
+
+  it("rejects playback without a position", async () => {
+    const { host } = await roomWithMedia();
+
+    host.send({ type: "playback.set", protocolVersion: ProtocolVersion, status: "playing" });
+
+    expect(await host.next()).toMatchObject({ type: "error", code: "invalid_message" });
   });
 
   it("rejects playback before any media is shared", async () => {

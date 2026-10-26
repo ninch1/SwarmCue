@@ -253,8 +253,10 @@ export function App() {
         src={videoSrc}
         emptyMessage={emptyPlayerMessage}
         playback={playback}
-        onLocalPlaybackChange={(status) => {
-          const error = room.setPlayback(status);
+        // Until the clock is measured, this client's own clock is the best guess.
+        getServerNowMs={() => room.estimateServerNowMs() ?? Date.now()}
+        onLocalPlaybackChange={({ status, positionSeconds }) => {
+          const error = room.setPlayback(status, positionSeconds);
           if (error) {
             console.error("Could not send playback command:", error);
           }

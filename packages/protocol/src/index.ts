@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /** Shared client-server message contract. */
-export const ProtocolVersion = 1 as const;
+export const ProtocolVersion = 2 as const;
 
 export type ProtocolVersion = typeof ProtocolVersion;
 
@@ -12,6 +12,8 @@ export const DISPLAY_NAME_MAX_LENGTH = 32;
 export const MAGNET_URI_MAX_LENGTH = 2048;
 export const MEDIA_NAME_MAX_LENGTH = 255;
 export const CLOCK_PING_ID_MAX = 2_147_483_647;
+/** Generous upper bound for a media position: one week. */
+export const POSITION_SECONDS_MAX = 7 * 24 * 60 * 60;
 
 const NO_CONTROL_CHARACTERS = /^\P{Cc}+$/u;
 
@@ -67,12 +69,23 @@ export const SharedMediaSchema = z.strictObject({
 
 export const PlaybackStatusSchema = z.enum(["playing", "paused"]);
 
+export const PositionSecondsSchema = z
+  .number()
+  .finite()
+  .nonnegative()
+  .max(POSITION_SECONDS_MAX);
+
 /**
- * Shared play/pause flag. `revision` increases on every accepted change, so
- * clients can tell a new command apart from an unchanged snapshot.
+ * Shared playback timeline: the media position at the server time of the
+ * latest accepted change. While playing, clients compute the current
+ * position as `positionSeconds + (serverNow - updatedAtServerMs) / 1000`.
+ * `revision` increases on every accepted change, so clients can tell a new
+ * command apart from an unchanged snapshot.
  */
 export const PlaybackStateSchema = z.strictObject({
   status: PlaybackStatusSchema,
+  positionSeconds: PositionSecondsSchema,
+  updatedAtServerMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   revision: z.number().int().nonnegative(),
 });
 
@@ -127,11 +140,15 @@ export const MediaSetMessageSchema = z.strictObject({
   media: SharedMediaSchema,
 });
 
-/** Any participant: play or pause the room's media. */
+/**
+ * Any participant: play, pause, or seek. The sender reports its own current
+ * position; a seek is the current status with a new position.
+ */
 export const PlaybackSetMessageSchema = z.strictObject({
   type: z.literal("playback.set"),
   protocolVersion: z.literal(ProtocolVersion),
   status: PlaybackStatusSchema,
+  positionSeconds: PositionSecondsSchema,
 });
 
 export const ClientMessageSchema = z.discriminatedUnion("type", [
