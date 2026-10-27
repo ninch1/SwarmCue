@@ -2,7 +2,8 @@
 
 ## Reminders
 
-- [ ] Add rate limiting for client WebSocket messages (architecture: reject excessive client messages). The rooms milestone only enforces a 4 KB `maxPayload` and schema validation. Include `playback.set`, since any participant can send it and each change is broadcast to the room, and `clock.ping`, which any connection may send even before joining a room, and `room.resume`, which any connection may send to guess a session (tokens are 256-bit, so guessing is impractical, but repeated attempts should still be throttled).
+- [ ] Add rate limiting for client WebSocket messages (architecture: reject excessive client messages). Today only `maxPayload` (now ~1 MiB, for shared subtitles) and schema validation apply. Include `playback.set`, since any participant can send it and each change is broadcast to the room, and `clock.ping`, which any connection may send even before joining a room, and `room.resume`, which any connection may send to guess a session (tokens are 256-bit, so guessing is impractical, but repeated attempts should still be throttled). Include `subtitle.set` and `subtitle.remove`: each accepted `subtitle.set` holds up to 512 KiB in memory and is re-sent to every participant.
+- [ ] Add per-connection byte budgets and a connection limit (per IP or overall). With `maxPayload` at ~1 MiB, many connections could each make the server buffer about 1 MiB at once.
 - [ ] Before the first deployment, measure web bundle size and load time, and consider lazy-loading WebTorrent (dynamic `import()` of `apps/web/src/torrent/client.ts`). The single JS chunk is ~549 KB minified (~167 KB gzipped), over Vite's 500 KB warning: React ~227 KB, WebTorrent ~230 KB, Zod and room code ~90 KB.
 - [ ] Revisit the torrent cache-cleanup policy if a media queue is ever added after V1. Deleting torrent data as soon as media changes fits V1's single current media item, but with a queue it would mean previously queued media must download again, the peer stops helping seed older items, and returning to a previous item is slower.
 
@@ -18,3 +19,4 @@
   - [ ] Picking a file, or receiving shared media, right after load waits for the sweep and still works.
   - [ ] Large file (multi-GB): storage usage drops back after switching or refreshing.
   - [ ] Browsers: Chrome, Firefox, Safari (Safari OPFS/Web Locks support and the memory-store fallback).
+- [ ] Test subtitles in Firefox and Safari (only Chrome has been checked): native `<track>` rendering and `::cue` styling, fullscreen (including iOS Safari's native player), the browser's own captions menu staying in step with the SwarmCue control, and sharing a room subtitle between two different browsers.

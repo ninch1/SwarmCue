@@ -49,7 +49,6 @@ describe("usePersonalSubtitles", () => {
     expect(result.current.subtitle).toMatchObject({
       fileName: "movie.srt",
       url: "blob:test-1",
-      enabled: true,
       cueCount: 1,
     });
     expect(blobs[0]?.type).toBe("text/vtt");

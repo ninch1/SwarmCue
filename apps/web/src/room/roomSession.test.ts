@@ -22,6 +22,7 @@ function snapshot(overrides: Partial<RoomSnapshot> = {}): RoomSnapshot {
     participants: [{ id: "p1", displayName: "Ada", connected: true }],
     media: null,
     playback: { status: "paused", positionSeconds: 0, updatedAtServerMs: 1, revision: 0 },
+    subtitle: null,
     ...overrides,
   };
 }
@@ -207,6 +208,8 @@ describe("createRoomSession", () => {
       snapshot: fresh,
       resyncKey: 2,
       error: null,
+      sharedSubtitle: null,
+      subtitleShare: { status: "idle" },
     });
   });
 
@@ -367,6 +370,209 @@ describe("createRoomSession", () => {
 
     expect(harness.connections).toHaveLength(2);
     expect(harness.room.getState()).toMatchObject({ connection: "reconnecting" });
+  });
+
+  describe("shared subtitle", () => {
+    const MAGNET = "magnet:?xt=urn:btih:c9e15763f722f23e98a29decdfae341b98d53056";
+    const media = { magnetUri: MAGNET, name: "movie.mp4", sizeBytes: 1024 };
+    const idA = "AAAAAAAAAAAAAAAAAAAAAA";
+    const idB = "BBBBBBBBBBBBBBBBBBBBBB";
+    const vttA = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nA\n";
+    const vttB = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nB\n";
+
+    function metadata(id: string, sharedBy = "p2") {
+      return { id, name: `${id.slice(0, 1)}.srt`, sizeBytes: 40, sharedBy };
+    }
+
+    function withSubtitle(id: string | null, sharedBy?: string) {
+      return snapshot({ media, subtitle: id ? metadata(id, sharedBy) : null });
+    }
+
+    function inRoom() {
+      const harness = joined();
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(null) });
+      return harness;
+    }
+
+    const stateOf = (harness: ReturnType<typeof setup>) => {
+      const state = harness.room.getState();
+      if (state.status !== "in-room") throw new Error("not in room");
+      return state;
+    };
+
+    it("keeps content whose id matches the snapshot", () => {
+      const harness = inRoom();
+
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(idA) });
+      harness.last().receive({ type: "subtitle.content", id: idA, content: vttA });
+
+      expect(stateOf(harness).sharedSubtitle).toEqual({ id: idA, vtt: vttA });
+    });
+
+    it("ignores content that the snapshot does not name (stale or early)", () => {
+      const harness = inRoom();
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(idB) });
+
+      harness.last().receive({ type: "subtitle.content", id: idA, content: vttA });
+
+      expect(stateOf(harness).sharedSubtitle).toBeNull();
+    });
+
+    it("drops content when the snapshot replaces or removes the subtitle", () => {
+      const harness = inRoom();
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(idA) });
+      harness.last().receive({ type: "subtitle.content", id: idA, content: vttA });
+
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(idB) });
+      expect(stateOf(harness).sharedSubtitle).toBeNull();
+      // A late copy of the replaced subtitle cannot restore it.
+      harness.last().receive({ type: "subtitle.content", id: idA, content: vttA });
+      expect(stateOf(harness).sharedSubtitle).toBeNull();
+      harness.last().receive({ type: "subtitle.content", id: idB, content: vttB });
+      expect(stateOf(harness).sharedSubtitle).toEqual({ id: idB, vtt: vttB });
+
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(null) });
+      expect(stateOf(harness).sharedSubtitle).toBeNull();
+    });
+
+    it("keeps the same content object through unrelated snapshots and repeats", () => {
+      const harness = inRoom();
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(idA) });
+      harness.last().receive({ type: "subtitle.content", id: idA, content: vttA });
+      const held = stateOf(harness).sharedSubtitle;
+      const states = harness.states.length;
+
+      harness.last().receive({ type: "subtitle.content", id: idA, content: vttA });
+      expect(harness.states).toHaveLength(states);
+      harness.last().receive({
+        type: "room.snapshot",
+        snapshot: { ...withSubtitle(idA), playback: { status: "playing", positionSeconds: 1, updatedAtServerMs: 2, revision: 1 } },
+      });
+      expect(stateOf(harness).sharedSubtitle).toBe(held);
+    });
+
+    it("keeps matching content across a resume and ignores the redelivery", () => {
+      const harness = inRoom();
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(idA) });
+      harness.last().receive({ type: "subtitle.content", id: idA, content: vttA });
+      const held = stateOf(harness).sharedSubtitle;
+
+      harness.last().drop();
+      harness.advance(500);
+      harness.last().open();
+      harness.last().receive({ type: "room.resumed", selfId: "p1", snapshot: withSubtitle(idA) });
+      harness.last().receive({ type: "subtitle.content", id: idA, content: vttA });
+
+      expect(stateOf(harness).sharedSubtitle).toBe(held);
+    });
+
+    it("drops content removed while reconnecting, and ignores the old connection", () => {
+      const harness = inRoom();
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(idA) });
+      harness.last().receive({ type: "subtitle.content", id: idA, content: vttA });
+      const old = harness.last();
+
+      old.drop();
+      harness.advance(500);
+      harness.last().open();
+      harness.last().receive({ type: "room.resumed", selfId: "p1", snapshot: withSubtitle(null) });
+      old.receive({ type: "room.snapshot", snapshot: withSubtitle(idA) });
+      old.receive({ type: "subtitle.content", id: idA, content: vttA });
+
+      expect(stateOf(harness).sharedSubtitle).toBeNull();
+      expect(stateOf(harness).snapshot.subtitle).toBeNull();
+    });
+
+    it("sends subtitle.set and subtitle.remove", () => {
+      const harness = inRoom();
+
+      expect(
+        harness.room.setSubtitle({ name: "a.srt", content: vttA, mediaMagnetUri: MAGNET }),
+      ).toBeNull();
+      expect(harness.room.removeSubtitle(idA)).toBeNull();
+
+      expect(harness.last().sent.slice(-2)).toEqual([
+        {
+          type: "subtitle.set",
+          protocolVersion: ProtocolVersion,
+          name: "a.srt",
+          content: vttA,
+          mediaMagnetUri: MAGNET,
+        },
+        { type: "subtitle.remove", protocolVersion: ProtocolVersion, id: idA },
+      ]);
+    });
+
+    it("tracks this tab's share until the server confirms it", () => {
+      const harness = inRoom();
+
+      harness.room.setSubtitle({ name: "a.srt", content: vttA, mediaMagnetUri: MAGNET });
+      expect(stateOf(harness).subtitleShare).toEqual({ status: "sending" });
+
+      // Someone else's subtitle is not a confirmation of ours.
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(idB, "p2") });
+      expect(stateOf(harness).subtitleShare).toEqual({ status: "sending" });
+
+      harness.last().receive({ type: "room.snapshot", snapshot: withSubtitle(idA, "p1") });
+      expect(stateOf(harness).subtitleShare).toEqual({ status: "idle" });
+    });
+
+    it("reports a server rejection of the share without a general room error", () => {
+      const harness = inRoom();
+      harness.room.setSubtitle({ name: "a.srt", content: vttA, mediaMagnetUri: MAGNET });
+
+      harness.last().receive({ type: "error", code: "media_changed", message: "The video changed." });
+
+      expect(stateOf(harness)).toMatchObject({
+        subtitleShare: { status: "failed", message: "The video changed." },
+        error: null,
+      });
+    });
+
+    it("reports invalid content locally without sending it", () => {
+      const harness = inRoom();
+      const sent = harness.last().sent.length;
+
+      const error = harness.room.setSubtitle({
+        name: "a.srt",
+        content: "not webvtt",
+        mediaMagnetUri: MAGNET,
+      });
+
+      expect(error).toBe("Shared subtitles must be WebVTT.");
+      expect(harness.last().sent).toHaveLength(sent);
+      expect(stateOf(harness).subtitleShare).toEqual({ status: "failed", message: error });
+    });
+
+    it("marks a share interrupted by a reconnect as failed unless it arrived", () => {
+      const harness = inRoom();
+      harness.room.setSubtitle({ name: "a.srt", content: vttA, mediaMagnetUri: MAGNET });
+
+      harness.last().drop();
+      harness.advance(500);
+      harness.last().open();
+      harness.last().receive({ type: "room.resumed", selfId: "p1", snapshot: withSubtitle(null) });
+
+      expect(stateOf(harness).subtitleShare).toEqual({
+        status: "failed",
+        message: "The connection dropped before the subtitle was shared.",
+      });
+    });
+
+    it("clears a failed share when the media changes", () => {
+      const harness = inRoom();
+      harness.room.setSubtitle({ name: "a.srt", content: vttA, mediaMagnetUri: MAGNET });
+      harness.last().receive({ type: "error", code: "media_changed", message: "x" });
+
+      harness.last().receive({
+        type: "room.snapshot",
+        snapshot: snapshot({
+          media: { ...media, magnetUri: "magnet:?xt=urn:btih:0000000000000000000000000000000000000000" },
+        }),
+      });
+
+      expect(stateOf(harness).subtitleShare).toEqual({ status: "idle" });
+    });
   });
 
   it("returns to the entry screen if creating a room fails", () => {

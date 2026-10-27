@@ -7,7 +7,7 @@ import {
   type ServerMessage,
 } from "@swarmcue/protocol";
 import { WebSocket, type RawData, type WebSocketServer } from "ws";
-import type { ConnectionId, RoomStore } from "../rooms/index.js";
+import type { ConnectionId, RoomStore, SubtitleDelivery } from "../rooms/index.js";
 
 /** Timer functions, injectable so tests can fire grace-period wake-ups deterministically. */
 export type Scheduler = {
@@ -43,6 +43,7 @@ const ERROR_TEXT: Record<
   | "not_host"
   | "not_in_room"
   | "no_media"
+  | "media_changed"
   | "resume_rejected"
   | "session_replaced",
   string
@@ -52,6 +53,7 @@ const ERROR_TEXT: Record<
   not_host: "Only the host can change the media.",
   not_in_room: "Join a room first.",
   no_media: "Nothing is playing yet.",
+  media_changed: "The video changed before the subtitle was shared.",
   resume_rejected: "This room session has ended.",
   session_replaced: "This room was opened in another tab or window.",
 };
@@ -89,6 +91,11 @@ export type RealtimeOptions = {
  *
  * Messages larger than the server's `maxPayload` are rejected by `ws`
  * itself, which closes the connection.
+ *
+ * Shared subtitle text never travels in snapshots. It follows, in its own
+ * `subtitle.content` message, the snapshot that names its id: to everyone
+ * when it is set, and to a participant right after joining or resuming.
+ * Each socket delivers in order, so clients see the id before the text.
  */
 export function attachRealtime(
   wss: WebSocketServer,
@@ -146,6 +153,28 @@ export function attachRealtime(
     for (const connection of connections.values()) {
       if (connection !== except) {
         send(connection.socket, { type: "room.snapshot", snapshot });
+      }
+    }
+  }
+
+  /** After room.joined or room.resumed: the text of the subtitle that snapshot names. */
+  function sendCurrentSubtitle(socket: WebSocket, roomId: RoomId): void {
+    const delivery = rooms.getSubtitleDelivery(roomId);
+    if (delivery) {
+      send(socket, { type: "subtitle.content", id: delivery.id, content: delivery.content });
+    }
+  }
+
+  function broadcastSubtitle(roomId: RoomId, delivery: SubtitleDelivery): void {
+    // Serialized once: it can be hundreds of kilobytes.
+    const data = JSON.stringify({
+      type: "subtitle.content",
+      id: delivery.id,
+      content: delivery.content,
+    } satisfies ServerMessage);
+    for (const connection of connectionsByRoom.get(roomId)?.values() ?? []) {
+      if (connection.socket.readyState === WebSocket.OPEN) {
+        connection.socket.send(data);
       }
     }
   }
@@ -267,6 +296,7 @@ export function attachRealtime(
           const { participant, resumeToken, snapshot } = result;
           bind(connection, { roomId: snapshot.roomId, participantId: participant.id });
           send(socket, { type: "room.joined", selfId: participant.id, resumeToken, snapshot });
+          sendCurrentSubtitle(socket, snapshot.roomId);
           broadcastSnapshot(snapshot, connection);
           return;
         }
@@ -301,6 +331,7 @@ export function attachRealtime(
             selfId: result.participantId,
             snapshot: result.snapshot,
           });
+          sendCurrentSubtitle(socket, message.roomId);
           if (result.changed) {
             broadcastSnapshot(result.snapshot, connection);
           }
@@ -352,6 +383,40 @@ export function attachRealtime(
           }
           // A request matching the current timeline is not re-broadcast, so
           // clients echoing the state they just applied cannot cause loops.
+          if (result.changed) {
+            broadcastSnapshot(result.snapshot);
+          }
+          return;
+        }
+        case "subtitle.set": {
+          if (!session) {
+            sendError(socket, "not_in_room", ERROR_TEXT.not_in_room);
+            return;
+          }
+          const result = rooms.setSubtitle(session.roomId, session.participantId, {
+            name: message.name,
+            content: message.content,
+            mediaMagnetUri: message.mediaMagnetUri,
+          });
+          if (!result.ok) {
+            sendError(socket, result.error, ERROR_TEXT[result.error]);
+            return;
+          }
+          // Metadata first, then the text it names.
+          broadcastSnapshot(result.snapshot);
+          broadcastSubtitle(session.roomId, result.delivery);
+          return;
+        }
+        case "subtitle.remove": {
+          if (!session) {
+            sendError(socket, "not_in_room", ERROR_TEXT.not_in_room);
+            return;
+          }
+          const result = rooms.removeSubtitle(session.roomId, session.participantId, message.id);
+          if (!result.ok) {
+            sendError(socket, result.error, ERROR_TEXT[result.error]);
+            return;
+          }
           if (result.changed) {
             broadcastSnapshot(result.snapshot);
           }

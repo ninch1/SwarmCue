@@ -55,7 +55,7 @@ function setup() {
 }
 
 describe("createPersonalSubtitles", () => {
-  it("loads a file as an enabled subtitle with an object URL", async () => {
+  it("loads a file as a subtitle with an object URL", async () => {
     const { subtitles, pending, states } = setup();
 
     const done = subtitles.select(new File(["x"], "movie.srt"));
@@ -68,7 +68,6 @@ describe("createPersonalSubtitles", () => {
         id: 1,
         fileName: "movie.srt",
         url: "blob:1:WEBVTT A",
-        enabled: true,
         cueCount: 3,
         skippedBlocks: 1,
       },
@@ -78,23 +77,9 @@ describe("createPersonalSubtitles", () => {
     expect(states.at(-1)).toBe(subtitles.getState());
   });
 
-  it("disables and re-enables without touching the URL", async () => {
-    const { subtitles, pick, created, revoked } = setup();
-    await pick("movie.srt", okResult("A"));
-
-    subtitles.setEnabled(false);
-    expect(subtitles.getState().subtitle?.enabled).toBe(false);
-    subtitles.setEnabled(true);
-
-    expect(subtitles.getState().subtitle).toMatchObject({ id: 1, enabled: true, url: created[0] });
-    expect(created).toHaveLength(1);
-    expect(revoked).toEqual([]);
-  });
-
   it("replaces a subtitle and revokes the old URL", async () => {
     const { subtitles, pick, created, revoked } = setup();
     await pick("one.srt", okResult("A"));
-    subtitles.setEnabled(false);
 
     await pick("two.vtt", okResult("B"));
 
@@ -102,7 +87,6 @@ describe("createPersonalSubtitles", () => {
       id: 2,
       fileName: "two.vtt",
       url: created[1],
-      enabled: true,
     });
     expect(revoked).toEqual([created[0]]);
   });
@@ -212,7 +196,6 @@ describe("createPersonalSubtitles", () => {
     const { subtitles, pick, live } = setup();
     await pick("a.srt", okResult("A"));
     await pick("b.srt", okResult("B"));
-    subtitles.setEnabled(false);
     await pick("bad.srt", badResult);
     subtitles.remove();
     await pick("c.srt", okResult("C"));
@@ -229,7 +212,6 @@ describe("createPersonalSubtitles", () => {
 
     subtitles.reset();
     subtitles.remove();
-    subtitles.setEnabled(false);
 
     expect(states).toEqual([]);
   });

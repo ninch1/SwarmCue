@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 /** Shared client-server message contract. */
-export const ProtocolVersion = 3 as const;
+export const ProtocolVersion = 4 as const;
 
 export type ProtocolVersion = typeof ProtocolVersion;
 
@@ -14,8 +14,41 @@ export const MEDIA_NAME_MAX_LENGTH = 255;
 export const CLOCK_PING_ID_MAX = 2_147_483_647;
 /** Generous upper bound for a media position: one week. */
 export const POSITION_SECONDS_MAX = 7 * 24 * 60 * 60;
+export const SUBTITLE_NAME_MAX_LENGTH = 255;
+/**
+ * Largest shared subtitle, in UTF-8 bytes of normalized WebVTT. Feature-length
+ * subtitles are typically 50–300 KB.
+ */
+export const SHARED_SUBTITLE_MAX_BYTES = 512 * 1024;
 
 const NO_CONTROL_CHARACTERS = /^\P{Cc}+$/u;
+
+/**
+ * Length of `text` encoded as UTF-8, without TextEncoder or Buffer so this
+ * package stays free of DOM/Node globals. A lone surrogate counts as the
+ * 3-byte replacement character it is encoded as.
+ */
+export function utf8ByteLength(text: string): number {
+  let bytes = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && isLowSurrogate(text.charCodeAt(index + 1))) {
+      bytes += 4;
+      index += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
 
 export const RoomIdSchema = z
   .string()
@@ -102,7 +135,58 @@ export const PlaybackStateSchema = z.strictObject({
   revision: z.number().int().nonnegative(),
 });
 
-/** Complete description of a room at one moment. Participants are in join order. */
+/** Server-generated: 16 random bytes as base64url. New for every shared subtitle. */
+export const SubtitleIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{22}$/, "Invalid subtitle id.");
+
+export const SubtitleNameSchema = z
+  .string()
+  .trim()
+  .min(1, "Subtitle names cannot be empty.")
+  .max(SUBTITLE_NAME_MAX_LENGTH, "Subtitle name is too long.")
+  .regex(NO_CONTROL_CHARACTERS, "Subtitle names cannot contain control characters.");
+
+/**
+ * Normalized WebVTT as produced by the web client. The server only checks its
+ * size and overall shape; browsers parse the cues themselves.
+ */
+export const SharedSubtitleContentSchema = z
+  .string()
+  // UTF-16 length never exceeds the UTF-8 length, so this cheaply bounds the exact check.
+  .max(SHARED_SUBTITLE_MAX_BYTES, "Shared subtitles can be at most 512 KB.")
+  .refine((text) => utf8ByteLength(text) <= SHARED_SUBTITLE_MAX_BYTES, {
+    message: "Shared subtitles can be at most 512 KB.",
+  })
+  .refine((text) => /^WEBVTT(?:[ \t][^\n]*)?\n/.test(text), {
+    message: "Shared subtitles must be WebVTT.",
+  })
+  // Normalized text uses LF line endings; only tabs and newlines are allowed as controls.
+  .refine((text) => !/[\u0000-\u0008\u000B-\u001F\u007F]/.test(text), {
+    message: "Shared subtitles cannot contain control characters.",
+  })
+  .refine((text) => text.endsWith("\n"), {
+    message: "Shared subtitles must end with a newline.",
+  })
+  .refine((text) => /^(?:\d{2,}:)?\d{2}:\d{2}\.\d{3}[ \t]+-->/m.test(text), {
+    message: "Shared subtitles must contain at least one cue.",
+  });
+
+/** What the room knows about its shared subtitle. The text itself is sent separately. */
+export const SharedSubtitleMetadataSchema = z.strictObject({
+  id: SubtitleIdSchema,
+  name: SubtitleNameSchema,
+  /** UTF-8 bytes of the WebVTT text, measured by the server. */
+  sizeBytes: z.number().int().min(1).max(SHARED_SUBTITLE_MAX_BYTES),
+  /** Who shared it; they may have left the room since. */
+  sharedBy: ParticipantIdSchema,
+});
+
+/**
+ * Complete description of a room at one moment. Participants are in join
+ * order. A shared subtitle appears only as metadata; its text is delivered
+ * in `subtitle.content`, so snapshots stay small.
+ */
 export const RoomSnapshotSchema = z
   .strictObject({
     roomId: RoomIdSchema,
@@ -110,6 +194,7 @@ export const RoomSnapshotSchema = z
     participants: z.array(ParticipantSchema),
     media: SharedMediaSchema.nullable(),
     playback: PlaybackStateSchema,
+    subtitle: SharedSubtitleMetadataSchema.nullable(),
   })
   .refine(
     (snapshot) =>
@@ -178,6 +263,29 @@ export const PlaybackSetMessageSchema = z.strictObject({
   positionSeconds: PositionSecondsSchema,
 });
 
+/**
+ * Any participant: share a subtitle with the room, replacing the current one
+ * (last write wins). `mediaMagnetUri` names the media it was chosen for; the
+ * server rejects it if the room's media has changed since.
+ */
+export const SubtitleSetMessageSchema = z.strictObject({
+  type: z.literal("subtitle.set"),
+  protocolVersion: z.literal(ProtocolVersion),
+  name: SubtitleNameSchema,
+  content: SharedSubtitleContentSchema,
+  mediaMagnetUri: MagnetUriSchema,
+});
+
+/**
+ * Any participant: remove the shared subtitle for everyone. Only removes the
+ * subtitle with this id, so nobody removes one they have not seen.
+ */
+export const SubtitleRemoveMessageSchema = z.strictObject({
+  type: z.literal("subtitle.remove"),
+  protocolVersion: z.literal(ProtocolVersion),
+  id: SubtitleIdSchema,
+});
+
 export const ClientMessageSchema = z.discriminatedUnion("type", [
   ClockPingMessageSchema,
   RoomCreateMessageSchema,
@@ -186,6 +294,8 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
   RoomLeaveMessageSchema,
   MediaSetMessageSchema,
   PlaybackSetMessageSchema,
+  SubtitleSetMessageSchema,
+  SubtitleRemoveMessageSchema,
 ]);
 
 // Server → client
@@ -199,6 +309,8 @@ export const ErrorCodeSchema = z.enum([
   "not_in_room",
   "not_host",
   "no_media",
+  /** The room's media changed after the client chose a subtitle for it. */
+  "media_changed",
   /** Unknown room, wrong token, or expired session; deliberately not more specific. */
   "resume_rejected",
   /** Another connection resumed this session; this one is closed and must not reconnect. */
@@ -226,7 +338,7 @@ export const RoomResumedMessageSchema = z.strictObject({
 
 /**
  * Sent whenever room membership, a participant's connection status, host,
- * shared media, or playback changes.
+ * shared media, playback, or the shared subtitle changes.
  */
 export const RoomSnapshotMessageSchema = z.strictObject({
   type: z.literal("room.snapshot"),
@@ -246,12 +358,24 @@ export const ClockPongMessageSchema = z.strictObject({
   serverTimeMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 });
 
+/**
+ * The text of the room's shared subtitle. Sent after the snapshot that names
+ * this id: to everyone when it is set, and to a participant after joining or
+ * resuming. Clients use it only while their latest snapshot has the same id.
+ */
+export const SubtitleContentMessageSchema = z.strictObject({
+  type: z.literal("subtitle.content"),
+  id: SubtitleIdSchema,
+  content: SharedSubtitleContentSchema,
+});
+
 export const ServerMessageSchema = z.discriminatedUnion("type", [
   RoomJoinedMessageSchema,
   RoomResumedMessageSchema,
   RoomSnapshotMessageSchema,
   ErrorMessageSchema,
   ClockPongMessageSchema,
+  SubtitleContentMessageSchema,
 ]);
 
 export type RoomId = z.infer<typeof RoomIdSchema>;
@@ -262,6 +386,8 @@ export type SharedMedia = z.infer<typeof SharedMediaSchema>;
 export type PlaybackStatus = z.infer<typeof PlaybackStatusSchema>;
 export type PlaybackState = z.infer<typeof PlaybackStateSchema>;
 export type RoomSnapshot = z.infer<typeof RoomSnapshotSchema>;
+export type SubtitleId = z.infer<typeof SubtitleIdSchema>;
+export type SharedSubtitleMetadata = z.infer<typeof SharedSubtitleMetadataSchema>;
 export type ClientMessage = z.infer<typeof ClientMessageSchema>;
 export type ServerMessage = z.infer<typeof ServerMessageSchema>;
 export type ErrorCode = z.infer<typeof ErrorCodeSchema>;

@@ -7,7 +7,11 @@ import {
 } from "@swarmcue/protocol";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
-import { createCoordinationServer, type CoordinationServer } from "../server.js";
+import {
+  createCoordinationServer,
+  MAX_MESSAGE_BYTES,
+  type CoordinationServer,
+} from "../server.js";
 import { SESSION_REPLACED_CLOSE_CODE, type Scheduler } from "./attach.js";
 
 const MESSAGE_TIMEOUT_MS = 2000;
@@ -279,6 +283,7 @@ describe("realtime rooms", () => {
         ],
         media: null,
         playback: initialPlayback,
+        subtitle: null,
       },
     });
   });
@@ -305,6 +310,7 @@ describe("realtime rooms", () => {
         participants: [{ id: viewerId, displayName: "Grace", connected: true }],
         media: null,
         playback: initialPlayback,
+        subtitle: null,
       },
     });
     expect(fakeScheduler.pending()).toHaveLength(0);
@@ -597,6 +603,7 @@ describe("realtime rooms", () => {
           ],
           media: null,
           playback: initialPlayback,
+          subtitle: null,
         },
       });
       expect(await host.next()).toMatchObject({
@@ -860,5 +867,214 @@ describe("realtime rooms", () => {
     ada.send({ type: "room.create", protocolVersion: ProtocolVersion, displayName: "Ada" });
 
     expect(await ada.next()).toMatchObject({ type: "error", code: "already_in_room" });
+  });
+
+  describe("shared subtitles", () => {
+    const vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nSecret cue text\n";
+
+    function subtitleSet(fields: Record<string, unknown> = {}) {
+      return {
+        type: "subtitle.set",
+        protocolVersion: ProtocolVersion,
+        name: "movie.en.srt",
+        content: vtt,
+        mediaMagnetUri: media.magnetUri,
+        ...fields,
+      };
+    }
+
+    function subtitleRemove(id: string) {
+      return { type: "subtitle.remove", protocolVersion: ProtocolVersion, id };
+    }
+
+    /** Next message, which must be a snapshot; returns its subtitle metadata. */
+    async function nextSubtitleMetadata(client: TestClient) {
+      const message = await client.next();
+      if (message.type !== "room.snapshot") {
+        throw new Error(`expected room.snapshot, got ${message.type}`);
+      }
+      expect(JSON.stringify(message)).not.toContain("Secret cue text");
+      return message.snapshot.subtitle;
+    }
+
+    it("sends everyone the metadata snapshot, then the matching content", async () => {
+      const { host, viewer, viewerId } = await roomWithMedia();
+
+      viewer.send(subtitleSet());
+
+      for (const participant of [host, viewer]) {
+        const metadata = await nextSubtitleMetadata(participant);
+        expect(metadata).toEqual({
+          id: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+          name: "movie.en.srt",
+          sizeBytes: vtt.length,
+          sharedBy: viewerId,
+        });
+        expect(await participant.next()).toEqual({
+          type: "subtitle.content",
+          id: metadata?.id,
+          content: vtt,
+        });
+      }
+    });
+
+    it("gives late joiners the metadata and then the matching content", async () => {
+      const { host, viewer, roomId } = await roomWithMedia();
+      host.send(subtitleSet());
+      const metadata = await nextSubtitleMetadata(viewer);
+      await viewer.next();
+
+      const late = await client();
+      late.send({ type: "room.join", protocolVersion: ProtocolVersion, roomId, displayName: "Linus" });
+
+      const joined = await late.next();
+      expect(joined).toMatchObject({ type: "room.joined", snapshot: { subtitle: metadata } });
+      expect(JSON.stringify(joined)).not.toContain("Secret cue text");
+      expect(await late.next()).toEqual({ type: "subtitle.content", id: metadata?.id, content: vtt });
+    });
+
+    it("sends the content again to a participant who resumes", async () => {
+      const { host, viewer, roomId, viewerToken } = await roomWithMedia();
+      host.send(subtitleSet());
+      const metadata = await nextSubtitleMetadata(viewer);
+      await viewer.next();
+      await viewer.close();
+
+      const returning = await client();
+      returning.send(resumeMessage(roomId, viewerToken));
+
+      expect(await returning.next()).toMatchObject({
+        type: "room.resumed",
+        snapshot: { subtitle: metadata },
+      });
+      expect(await returning.next()).toEqual({
+        type: "subtitle.content",
+        id: metadata?.id,
+        content: vtt,
+      });
+    });
+
+    it("sends no content to joiners when there is no subtitle", async () => {
+      const { roomId } = await roomWithMedia();
+
+      const late = await client();
+      late.send({ type: "room.join", protocolVersion: ProtocolVersion, roomId, displayName: "Linus" });
+      await late.next();
+      late.send(clockPing(1));
+
+      expect(await late.next()).toMatchObject({ type: "clock.pong", id: 1 });
+    });
+
+    it("converges on the last of two nearly simultaneous subtitles", async () => {
+      const { host, viewer } = await roomWithMedia();
+
+      host.send(subtitleSet({ name: "first.srt" }));
+      viewer.send(subtitleSet({ name: "second.srt" }));
+
+      const seen: string[] = [];
+      for (let index = 0; index < 4; index += 1) {
+        const message = await host.next();
+        seen.push(message.type === "room.snapshot" ? `meta:${message.snapshot.subtitle?.name}` : message.type);
+      }
+      expect(seen).toEqual([
+        "meta:first.srt",
+        "subtitle.content",
+        "meta:second.srt",
+        "subtitle.content",
+      ]);
+    });
+
+    it("removes only the subtitle the sender saw", async () => {
+      const { host, viewer } = await roomWithMedia();
+      host.send(subtitleSet({ name: "first.srt" }));
+      const first = await nextSubtitleMetadata(viewer);
+      await viewer.next();
+      viewer.send(subtitleSet({ name: "second.srt" }));
+      const second = await nextSubtitleMetadata(viewer);
+      await viewer.next();
+      await host.next();
+      await host.next();
+      await host.next();
+      await host.next();
+
+      // A stale remove of the first subtitle is ignored, without a broadcast.
+      host.send(subtitleRemove(first!.id));
+      host.send(clockPing(1));
+      expect(await host.next()).toMatchObject({ type: "clock.pong", id: 1 });
+
+      host.send(subtitleRemove(second!.id));
+      expect(await nextSubtitleMetadata(host)).toBeNull();
+      expect(await nextSubtitleMetadata(viewer)).toBeNull();
+    });
+
+    it("clears the subtitle when the host shares new media", async () => {
+      const { host, viewer } = await roomWithMedia();
+      host.send(subtitleSet());
+      await nextSubtitleMetadata(viewer);
+      await viewer.next();
+
+      host.send(
+        mediaSet({
+          ...media,
+          magnetUri: "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+        }),
+      );
+
+      expect(await nextSubtitleMetadata(viewer)).toBeNull();
+    });
+
+    it("rejects a subtitle for media that changed, or with no media", async () => {
+      const { host } = await hostAndViewer();
+      host.send(subtitleSet());
+      expect(await host.next()).toMatchObject({ type: "error", code: "no_media" });
+
+      host.send(mediaSet(media));
+      await host.next();
+      host.send(
+        subtitleSet({
+          mediaMagnetUri: "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+        }),
+      );
+      expect(await host.next()).toMatchObject({ type: "error", code: "media_changed" });
+    });
+
+    it("rejects subtitle commands from a socket whose session was replaced", async () => {
+      const { viewer, roomId, viewerToken } = await roomWithMedia();
+      const replacement = await client();
+      replacement.send(resumeMessage(roomId, viewerToken));
+      await replacement.next();
+      expect(await viewer.next()).toMatchObject({ type: "error", code: "session_replaced" });
+
+      // ws may still deliver a message sent before the close completes.
+      if (viewer.socket.readyState === WebSocket.OPEN) {
+        viewer.send(subtitleSet());
+        expect(await viewer.next()).toMatchObject({ type: "error", code: "not_in_room" });
+      }
+      expect(await viewer.closed).toBe(SESSION_REPLACED_CLOSE_CODE);
+    });
+
+    it("rejects oversized content with an error that does not echo it", async () => {
+      const { viewer } = await roomWithMedia();
+      const content = `${vtt}${"x".repeat(512 * 1024)}\n`;
+
+      viewer.send(subtitleSet({ content }));
+
+      const reply = await viewer.next();
+      expect(reply).toMatchObject({ type: "error", code: "invalid_message" });
+      expect(JSON.stringify(reply)).not.toContain("Secret cue text");
+      expect(viewer.socket.readyState).toBe(WebSocket.OPEN);
+    });
+
+    it("closes the connection for a frame over the payload limit, keeping the room", async () => {
+      const { host, viewer } = await roomWithMedia();
+
+      viewer.sendRaw("x".repeat(MAX_MESSAGE_BYTES + 1));
+
+      expect(await viewer.closed).toBe(1009);
+      expect(await host.next()).toMatchObject({
+        type: "room.snapshot",
+        snapshot: { participants: [{ connected: true }, { connected: false }] },
+      });
+    });
   });
 });

@@ -20,7 +20,7 @@ import {
 } from "./media/sharedMediaMemory.js";
 import { browserSessionStorage } from "./room/sessionStore.js";
 import { useRoom } from "./room/useRoom.js";
-import { usePersonalSubtitles } from "./subtitles/usePersonalSubtitles.js";
+import { useSubtitles } from "./subtitles/useSubtitles.js";
 import {
   clearActiveTorrent,
   createMagnetFromFile,
@@ -270,17 +270,6 @@ export function App() {
   }
   const fileName = source.kind === "file" ? source.fileName : null;
 
-  // Personal subtitles belong to what the player shows. Each picked file is
-  // new media; a stream is identified by its torrent, so reconnecting keeps
-  // the subtitle while new room media, leaving, or another room drops it.
-  let subtitleMediaKey: string | null = null;
-  if (source.kind === "file") {
-    subtitleMediaKey = `file:${source.objectUrl}`;
-  } else if (source.kind === "magnet") {
-    subtitleMediaKey = `torrent:${infoHashOf(source.magnetUri) ?? source.magnetUri}`;
-  }
-  const subtitles = usePersonalSubtitles(subtitleMediaKey);
-
   // The host's media counts as shared only once a server snapshot carries it.
   const hostMagnetUri = magnetGeneration.magnetUri;
   // A local file that is not (yet) the room's media is a private preview: it
@@ -288,6 +277,42 @@ export function App() {
   const localFileIsRoomMedia =
     showingLocalFile && isSameTorrent(hostMagnetUri, sharedMagnetUri);
   const playerPlayback = showingLocalFile && !localFileIsRoomMedia ? null : playback;
+
+  // Subtitles belong to what the player shows. Each picked file is new
+  // media; a stream is identified by its torrent, so reconnecting keeps the
+  // subtitle while new room media, leaving, or another room drops it.
+  let subtitleMediaKey: string | null = null;
+  if (source.kind === "file") {
+    subtitleMediaKey = `file:${source.objectUrl}`;
+  } else if (source.kind === "magnet") {
+    subtitleMediaKey = `torrent:${infoHashOf(source.magnetUri) ?? source.magnetUri}`;
+  }
+  // The room subtitle belongs to the room's media, not to a host's private preview.
+  const showsRoomMedia = source.kind === "magnet" || localFileIsRoomMedia;
+  const inRoomState = room.state.status === "in-room" ? room.state : null;
+  const roomSubtitleMetadata = showsRoomMedia ? (inRoomState?.snapshot.subtitle ?? null) : null;
+  const subtitles = useSubtitles({
+    mediaKey: subtitleMediaKey,
+    room:
+      inRoomState && roomSubtitleMetadata
+        ? {
+            metadata: roomSubtitleMetadata,
+            text: inRoomState.sharedSubtitle,
+            sharedByName:
+              inRoomState.snapshot.participants.find(
+                (participant) => participant.id === roomSubtitleMetadata.sharedBy,
+              )?.displayName ?? null,
+          }
+        : null,
+    shareTarget:
+      showsRoomMedia && currentRoomId && sharedMagnetUri
+        ? { mediaMagnetUri: sharedMagnetUri, key: `${currentRoomId}|${sharedMagnetUri}` }
+        : null,
+    shareStatus: inRoomState?.subtitleShare ?? { status: "idle" },
+    selfId: inRoomState?.selfId ?? null,
+    setSubtitle: room.setSubtitle,
+    removeSubtitle: room.removeSubtitle,
+  });
   const roomError = room.state.status === "in-room" ? room.state.error : null;
   const otherParticipants =
     room.state.status === "in-room"
@@ -392,17 +417,8 @@ export function App() {
             console.error("Could not send playback command:", error);
           }
         }}
-        subtitle={
-          subtitles.subtitle
-            ? {
-                id: subtitles.subtitle.id,
-                url: subtitles.subtitle.url,
-                label: subtitles.subtitle.fileName,
-                enabled: subtitles.subtitle.enabled,
-              }
-            : null
-        }
-        onSubtitleEnabledChange={subtitles.setEnabled}
+        subtitle={subtitles.track}
+        onSubtitleEnabledChange={subtitles.onTrackEnabledChange}
         onError={() => {
           setPlayerError(
             "The browser could not play this video. Its format or codec may be unsupported.",
@@ -411,16 +427,7 @@ export function App() {
       />
 
       {subtitleMediaKey !== null ? (
-        <SubtitleControl
-          fileName={subtitles.subtitle?.fileName ?? null}
-          enabled={subtitles.subtitle?.enabled ?? false}
-          skippedBlocks={subtitles.subtitle?.skippedBlocks ?? 0}
-          loading={subtitles.loading}
-          error={subtitles.error}
-          onFileSelected={subtitles.select}
-          onEnabledChange={subtitles.setEnabled}
-          onRemove={subtitles.remove}
-        />
+        <SubtitleControl {...subtitles.control} />
       ) : null}
 
       {playerError ? (

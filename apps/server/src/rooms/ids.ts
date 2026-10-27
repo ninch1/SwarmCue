@@ -5,6 +5,7 @@ import {
   type ParticipantId,
   type ResumeToken,
   type RoomId,
+  type SubtitleId,
 } from "@swarmcue/protocol";
 
 /**
@@ -26,6 +27,11 @@ export function generateParticipantId(): ParticipantId {
 /** 32 bytes (256 bits) from a CSPRNG, as 43 base64url characters. */
 export function generateResumeToken(): ResumeToken {
   return randomBytes(32).toString("base64url");
+}
+
+/** 16 random bytes as 22 base64url characters; not a secret, just unique. */
+export function generateSubtitleId(): SubtitleId {
+  return randomBytes(16).toString("base64url");
 }
 
 /** Only this hash is kept in memory, never the token itself. */

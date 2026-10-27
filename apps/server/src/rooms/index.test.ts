@@ -1,6 +1,11 @@
-import { ResumeTokenSchema, RoomIdSchema } from "@swarmcue/protocol";
+import { ResumeTokenSchema, RoomIdSchema, SubtitleIdSchema } from "@swarmcue/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
-import { generateResumeToken, generateRoomId, hashResumeToken } from "./ids.js";
+import {
+  generateResumeToken,
+  generateRoomId,
+  generateSubtitleId,
+  hashResumeToken,
+} from "./ids.js";
 import { createRoomStore } from "./index.js";
 
 const START_MS = 1_700_000_000_000;
@@ -11,6 +16,11 @@ const clock = { nowMs: START_MS };
 beforeEach(() => {
   clock.nowMs = START_MS;
 });
+
+/** The Nth generated subtitle id: 22 characters, like real ones. */
+function subtitleIdOf(n: number): string {
+  return `sub${n}`.padEnd(22, "x");
+}
 
 /**
  * Participants are p1, p2, … with resume tokens tok1, tok2, …. Tests use
@@ -23,6 +33,7 @@ function createTestStore(options: {
   const roomIds = [...(options.roomIds ?? ["AAAAAAAA", "BBBBBBBB", "CCCCCCCC"])];
   let participantCount = 0;
   let tokenCount = 0;
+  let subtitleCount = 0;
 
   return createRoomStore({
     generateRoomId: () => {
@@ -39,6 +50,10 @@ function createTestStore(options: {
     generateResumeToken: () => {
       tokenCount += 1;
       return `tok${tokenCount}`;
+    },
+    generateSubtitleId: () => {
+      subtitleCount += 1;
+      return subtitleIdOf(subtitleCount);
     },
     hashResumeToken: (token) => `hash:${token}`,
     maxParticipants: options.maxParticipants ?? 5,
@@ -86,6 +101,7 @@ describe("createRoomStore", () => {
       participants: [ada],
       media: null,
       playback: initialPlayback,
+      subtitle: null,
     });
   });
 
@@ -105,6 +121,7 @@ describe("createRoomStore", () => {
         participants: [ada, grace],
         media: null,
         playback: initialPlayback,
+        subtitle: null,
       },
     });
     expect(store.getSnapshot("AAAAAAAA")).toEqual(joined.ok ? joined.snapshot : null);
@@ -425,6 +442,7 @@ describe("setMedia", () => {
         participants: [ada, grace],
         media,
         playback: { ...initialPlayback, revision: 1 },
+        subtitle: null,
       },
     });
     expect(store.getSnapshot(snapshot.roomId)?.media).toEqual(media);
@@ -624,7 +642,176 @@ describe("setPlayback", () => {
   });
 });
 
+describe("shared subtitle", () => {
+  const vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHéllo\n";
+  const request = { name: "movie.en.srt", content: vtt, mediaMagnetUri: media.magnetUri };
+
+  function roomWithMedia() {
+    const { store, roomId } = roomOfThree();
+    store.setMedia(roomId, "p1", media);
+    return { store, roomId };
+  }
+
+  it("lets any participant share a subtitle, exposing only metadata in snapshots", () => {
+    const { store, roomId } = roomWithMedia();
+
+    const result = store.setSubtitle(roomId, "p2", request);
+
+    const metadata = {
+      id: subtitleIdOf(1),
+      name: "movie.en.srt",
+      // "é" is two bytes in UTF-8.
+      sizeBytes: vtt.length + 1,
+      sharedBy: "p2",
+    };
+    expect(result).toEqual({
+      ok: true,
+      snapshot: expect.objectContaining({ subtitle: metadata }),
+      delivery: { id: subtitleIdOf(1), content: vtt },
+    });
+    expect(store.getSnapshot(roomId)?.subtitle).toEqual(metadata);
+    expect(JSON.stringify(store.getSnapshot(roomId))).not.toContain("Héllo");
+    expect(store.getSubtitleDelivery(roomId)).toEqual({ id: subtitleIdOf(1), content: vtt });
+  });
+
+  it("replaces the subtitle with a new id every time, last write wins", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setSubtitle(roomId, "p2", request);
+
+    const second = store.setSubtitle(roomId, "p3", { ...request, name: "other.vtt" });
+    const third = store.setSubtitle(roomId, "p3", { ...request, name: "other.vtt" });
+
+    expect(second.ok && second.delivery.id).toBe(subtitleIdOf(2));
+    expect(third.ok && third.delivery.id).toBe(subtitleIdOf(3));
+    expect(store.getSnapshot(roomId)?.subtitle).toMatchObject({
+      id: subtitleIdOf(3),
+      name: "other.vtt",
+      sharedBy: "p3",
+    });
+  });
+
+  it("rejects a subtitle when nothing is playing", () => {
+    const { store, roomId } = roomOfThree();
+
+    expect(store.setSubtitle(roomId, "p1", request)).toEqual({ ok: false, error: "no_media" });
+    expect(store.getSnapshot(roomId)?.subtitle).toBeNull();
+  });
+
+  it("rejects a subtitle chosen for media that has since been replaced", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setMedia(roomId, "p1", {
+      ...media,
+      magnetUri: "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+    });
+
+    expect(store.setSubtitle(roomId, "p2", request)).toEqual({
+      ok: false,
+      error: "media_changed",
+    });
+    expect(store.getSubtitleDelivery(roomId)).toBeNull();
+  });
+
+  it("rejects senders who are not in the room, and unknown rooms", () => {
+    const { store, roomId } = roomWithMedia();
+
+    expect(store.setSubtitle(roomId, "intruder", request)).toEqual({
+      ok: false,
+      error: "not_in_room",
+    });
+    expect(store.setSubtitle("ZZZZZZZZ", "p1", request)).toEqual({
+      ok: false,
+      error: "room_not_found",
+    });
+    expect(store.removeSubtitle(roomId, "intruder", subtitleIdOf(1))).toEqual({
+      ok: false,
+      error: "not_in_room",
+    });
+  });
+
+  it("removes the subtitle it was asked to remove", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setSubtitle(roomId, "p2", request);
+
+    const result = store.removeSubtitle(roomId, "p3", subtitleIdOf(1));
+
+    expect(result).toEqual({
+      ok: true,
+      changed: true,
+      snapshot: expect.objectContaining({ subtitle: null }),
+    });
+    expect(store.getSubtitleDelivery(roomId)).toBeNull();
+  });
+
+  it("does nothing when removing a subtitle that was already replaced or removed", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setSubtitle(roomId, "p2", request);
+    store.setSubtitle(roomId, "p3", request);
+
+    expect(store.removeSubtitle(roomId, "p1", subtitleIdOf(1))).toEqual({
+      ok: true,
+      changed: false,
+    });
+    expect(store.getSnapshot(roomId)?.subtitle?.id).toBe(subtitleIdOf(2));
+
+    store.removeSubtitle(roomId, "p1", subtitleIdOf(2));
+    expect(store.removeSubtitle(roomId, "p1", subtitleIdOf(2))).toEqual({
+      ok: true,
+      changed: false,
+    });
+  });
+
+  it("clears the subtitle when new media is shared", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setSubtitle(roomId, "p2", request);
+
+    const result = store.setMedia(roomId, "p1", { ...media, name: "other.mp4" });
+
+    expect(result.ok && result.snapshot.subtitle).toBeNull();
+    expect(store.getSubtitleDelivery(roomId)).toBeNull();
+  });
+
+  it("keeps the subtitle through disconnects, resumes, leaving and host transfer", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setSubtitle(roomId, "p2", request);
+
+    store.markDisconnected(roomId, "p2", 2);
+    store.resume(roomId, "tok2", 20);
+    store.markDisconnected(roomId, "p3", 3);
+    clock.nowMs += GRACE_MS;
+    store.expireDue();
+    const left = store.leave(roomId, "p1", 1);
+
+    expect(left.ok && left.snapshot).toMatchObject({
+      hostId: "p2",
+      subtitle: { id: subtitleIdOf(1), sharedBy: "p2" },
+    });
+    expect(store.getSubtitleDelivery(roomId)?.id).toBe(subtitleIdOf(1));
+  });
+
+  it("disappears with the room", () => {
+    const { store, roomId } = roomWithMedia();
+    store.setSubtitle(roomId, "p2", request);
+
+    store.leave(roomId, "p1", 1);
+    store.leave(roomId, "p2", 2);
+    store.leave(roomId, "p3", 3);
+
+    expect(store.getSubtitleDelivery(roomId)).toBeNull();
+    expect(store.getSnapshot(roomId)).toBeNull();
+  });
+});
+
 describe("ids", () => {
+  it("generates unique subtitle ids that match the protocol format", () => {
+    const ids = new Set<string>();
+    for (let index = 0; index < 100; index += 1) {
+      const id = generateSubtitleId();
+      expect(SubtitleIdSchema.safeParse(id).success).toBe(true);
+      ids.add(id);
+    }
+    expect(ids.size).toBe(100);
+  });
+
   it("generates room codes that match the protocol format", () => {
     for (let index = 0; index < 100; index += 1) {
       expect(RoomIdSchema.safeParse(generateRoomId()).success).toBe(true);

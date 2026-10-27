@@ -6,10 +6,10 @@ import {
   type PersonalSubtitleState,
 } from "./personalSubtitles.js";
 import { readSubtitleFile } from "./readSubtitleFile.js";
+import { vttObjectUrl } from "./vttObjectUrl.js";
 
 export type UsePersonalSubtitles = PersonalSubtitleState & {
   select: (file: File) => void;
-  setEnabled: (enabled: boolean) => void;
   remove: () => void;
 };
 
@@ -25,7 +25,7 @@ export function usePersonalSubtitles(mediaKey: string | null): UsePersonalSubtit
   useEffect(() => {
     const controller = createPersonalSubtitles({
       readFile: readSubtitleFile,
-      createObjectUrl: (vtt) => URL.createObjectURL(new Blob([vtt], { type: "text/vtt" })),
+      createObjectUrl: vttObjectUrl,
       revokeObjectUrl: (url) => URL.revokeObjectURL(url),
       onStateChange: setState,
     });
@@ -50,7 +50,6 @@ export function usePersonalSubtitles(mediaKey: string | null): UsePersonalSubtit
   return {
     ...state,
     select: (file) => void controllerRef.current?.select(file),
-    setEnabled: (enabled) => controllerRef.current?.setEnabled(enabled),
     remove: () => controllerRef.current?.remove(),
   };
 }

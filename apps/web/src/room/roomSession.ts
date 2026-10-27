@@ -7,6 +7,7 @@ import {
   type RoomSnapshot,
   type ServerMessage,
   type SharedMedia,
+  type SubtitleId,
 } from "@swarmcue/protocol";
 import { estimateServerTimeMs, type ClockSample } from "../clock/clockEstimate.js";
 import type { ClockSync, ClockSyncOptions } from "../clock/clockSync.js";
@@ -18,23 +19,45 @@ import type { SessionStore, StoredSession } from "./sessionStore.js";
 /** Close code the server uses when another connection resumed this session. */
 const SESSION_REPLACED_CLOSE_CODE = 4000;
 
+/** The text of the room's shared subtitle; always the one `snapshot.subtitle` names. */
+export type SharedSubtitleText = { id: SubtitleId; vtt: string };
+
+/** This tab's latest attempt to share a subtitle with the room. */
+export type SubtitleShareStatus =
+  | { status: "idle" }
+  | { status: "sending" }
+  | { status: "failed"; message: string };
+
+export type InRoomState = {
+  status: "in-room";
+  /** While reconnecting, `snapshot` is the last known room state. */
+  connection: "connected" | "reconnecting";
+  selfId: ParticipantId;
+  snapshot: RoomSnapshot;
+  /** Increases on every successful join or resume; consumers re-apply room state. */
+  resyncKey: number;
+  /** Latest server error while in the room; cleared by the next snapshot. */
+  error: string | null;
+  /** Null until the text for `snapshot.subtitle` arrives, or when there is none. */
+  sharedSubtitle: SharedSubtitleText | null;
+  subtitleShare: SubtitleShareStatus;
+};
+
 export type RoomState =
   | { status: "idle"; error: string | null }
   /** Creating or joining a room. */
   | { status: "connecting" }
   /** Reclaiming a stored session after a page load; no room state yet. */
   | { status: "resuming" }
-  | {
-      status: "in-room";
-      /** While reconnecting, `snapshot` is the last known room state. */
-      connection: "connected" | "reconnecting";
-      selfId: ParticipantId;
-      snapshot: RoomSnapshot;
-      /** Increases on every successful join or resume; consumers re-apply room state. */
-      resyncKey: number;
-      /** Latest server error while in the room; cleared by the next snapshot. */
-      error: string | null;
-    };
+  | InRoomState;
+
+export type SubtitleShareRequest = {
+  name: string;
+  /** Normalized WebVTT. */
+  content: string;
+  /** The room media this subtitle was chosen for. */
+  mediaMagnetUri: string;
+};
 
 type TimerHandle = unknown;
 
@@ -62,6 +85,10 @@ export type RoomSession = {
   setMedia: (media: SharedMedia) => string | null;
   /** Returns a message when the command cannot be sent, otherwise null. */
   setPlayback: (status: PlaybackStatus, positionSeconds: number) => string | null;
+  /** Share a subtitle with everyone. Returns a message when it cannot be sent, otherwise null. */
+  setSubtitle: (request: SubtitleShareRequest) => string | null;
+  /** Remove the shared subtitle `id` for everyone. Returns a message when it cannot be sent. */
+  removeSubtitle: (id: SubtitleId) => string | null;
   /** Estimated server epoch ms, or null before any clock measurement. */
   estimateServerNowMs: () => number | null;
   /** Re-measure the clock now (e.g. when the tab becomes visible). */
@@ -85,6 +112,35 @@ const MESSAGE_REPLACED = "This room was opened in another tab or window.";
 const MESSAGE_UPDATED = "SwarmCue was updated. Reload the page to rejoin the room.";
 const MESSAGE_GAVE_UP = "Couldn't reconnect to the room.";
 const MESSAGE_RECONNECTING = "Reconnecting to the room…";
+const MESSAGE_SHARE_INTERRUPTED = "The connection dropped before the subtitle was shared.";
+
+const SHARE_IDLE: SubtitleShareStatus = { status: "idle" };
+
+/**
+ * Apply a new snapshot. The shared subtitle text is kept only while the
+ * snapshot still names it, so a removed or replaced subtitle disappears.
+ */
+function withSnapshot(current: InRoomState, next: RoomSnapshot): InRoomState {
+  const sharedSubtitle =
+    current.sharedSubtitle && current.sharedSubtitle.id === next.subtitle?.id
+      ? current.sharedSubtitle
+      : null;
+  let subtitleShare = current.subtitleShare;
+  if (
+    subtitleShare.status === "sending" &&
+    next.subtitle?.sharedBy === current.selfId &&
+    next.subtitle.id !== current.snapshot.subtitle?.id
+  ) {
+    subtitleShare = SHARE_IDLE;
+  } else if (
+    subtitleShare.status === "failed" &&
+    next.media?.magnetUri !== current.snapshot.media?.magnetUri
+  ) {
+    // The failure was about media that is gone.
+    subtitleShare = SHARE_IDLE;
+  }
+  return { ...current, snapshot: next, sharedSubtitle, subtitleShare, error: null };
+}
 
 /** Returns the validated message, or the first validation message as a string. */
 function validateClientMessage(rawMessage: unknown, fallback: string): ClientMessage | string {
@@ -163,6 +219,18 @@ export function createRoomSession(deps: RoomSessionDeps): RoomSession {
 
   function enterRoom(selfId: ParticipantId, snapshot: RoomSnapshot): void {
     retryCount = 0;
+    // A resume into the same room keeps what is still valid; the server
+    // sends the subtitle text again anyway, which is then ignored.
+    const previous =
+      state.status === "in-room" && state.snapshot.roomId === snapshot.roomId ? state : null;
+    let subtitleShare = previous?.subtitleShare ?? SHARE_IDLE;
+    if (subtitleShare.status === "sending") {
+      subtitleShare =
+        snapshot.subtitle?.sharedBy === selfId &&
+        snapshot.subtitle.id !== previous?.snapshot.subtitle?.id
+          ? SHARE_IDLE
+          : { status: "failed", message: MESSAGE_SHARE_INTERRUPTED };
+    }
     setState({
       status: "in-room",
       connection: "connected",
@@ -170,6 +238,11 @@ export function createRoomSession(deps: RoomSessionDeps): RoomSession {
       snapshot,
       resyncKey: nextResyncKey++,
       error: null,
+      sharedSubtitle:
+        previous?.sharedSubtitle && previous.sharedSubtitle.id === snapshot.subtitle?.id
+          ? previous.sharedSubtitle
+          : null,
+      subtitleShare,
     });
   }
 
@@ -237,7 +310,18 @@ export function createRoomSession(deps: RoomSessionDeps): RoomSession {
     switch (message.type) {
       case "room.snapshot":
         if (state.status === "in-room") {
-          setState({ ...state, snapshot: message.snapshot, error: null });
+          setState(withSnapshot(state, message.snapshot));
+        }
+        return;
+      case "subtitle.content":
+        // Only the text the latest snapshot names; a stale or early one is
+        // ignored, and a repeat (e.g. after resuming) changes nothing.
+        if (
+          state.status === "in-room" &&
+          state.snapshot.subtitle?.id === message.id &&
+          state.sharedSubtitle?.id !== message.id
+        ) {
+          setState({ ...state, sharedSubtitle: { id: message.id, vtt: message.content } });
         }
         return;
       case "error":
@@ -246,7 +330,15 @@ export function createRoomSession(deps: RoomSessionDeps): RoomSession {
           return;
         }
         if (state.status === "in-room") {
-          setState({ ...state, error: message.message });
+          // The server answers a subtitle.set with an error or the new snapshot.
+          if (state.subtitleShare.status === "sending") {
+            setState({
+              ...state,
+              subtitleShare: { status: "failed", message: message.message },
+            });
+          } else {
+            setState({ ...state, error: message.message });
+          }
         }
         return;
       default:
@@ -444,6 +536,33 @@ export function createRoomSession(deps: RoomSessionDeps): RoomSession {
       return sendInRoom(
         { type: "playback.set", protocolVersion: ProtocolVersion, status, positionSeconds },
         "Invalid playback command.",
+      );
+    },
+
+    setSubtitle({ name, content, mediaMagnetUri }) {
+      const error = sendInRoom(
+        {
+          type: "subtitle.set",
+          protocolVersion: ProtocolVersion,
+          name,
+          content,
+          mediaMagnetUri,
+        },
+        "This subtitle cannot be shared.",
+      );
+      if (state.status === "in-room") {
+        setState({
+          ...state,
+          subtitleShare: error ? { status: "failed", message: error } : { status: "sending" },
+        });
+      }
+      return error;
+    },
+
+    removeSubtitle(id) {
+      return sendInRoom(
+        { type: "subtitle.remove", protocolVersion: ProtocolVersion, id },
+        "Invalid subtitle.",
       );
     },
 

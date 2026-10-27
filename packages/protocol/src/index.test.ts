@@ -3,8 +3,10 @@ import {
   CLOCK_PING_ID_MAX,
   POSITION_SECONDS_MAX,
   ProtocolVersion,
+  SHARED_SUBTITLE_MAX_BYTES,
   ServerMessageSchema,
   parseClientMessage,
+  utf8ByteLength,
 } from "./index.js";
 
 const validRoomId = "K7QM3XPD";
@@ -347,6 +349,7 @@ describe("ServerMessageSchema", () => {
         participants: [{ id: "p1", displayName: "Ada", connected: true }],
         media: null,
         playback,
+        subtitle: null,
       },
     };
   }
@@ -362,6 +365,7 @@ describe("ServerMessageSchema", () => {
         participants: [{ id: "p1", displayName: "Ada", connected: true }],
         media: { magnetUri: validMagnet, name: "movie.mp4", sizeBytes: 1024 },
         playback: { ...pausedPlayback, status: "playing", positionSeconds: 42.5, revision: 3 },
+        subtitle: null,
       },
     });
 
@@ -403,6 +407,7 @@ describe("ServerMessageSchema", () => {
         participants: [{ id: "p1", displayName: "Ada", connected: true }],
         media: null,
         playback: { ...pausedPlayback, revision: -1 },
+        subtitle: null,
       },
     });
 
@@ -418,6 +423,7 @@ describe("ServerMessageSchema", () => {
         participants: [{ id: "p1", displayName: "Ada", connected: true }],
         media: null,
         playback: pausedPlayback,
+        subtitle: null,
       },
     });
 
@@ -473,5 +479,188 @@ describe("ServerMessageSchema", () => {
     });
 
     expect(result.success).toBe(false);
+  });
+});
+
+const vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n";
+const subtitleId = "AbCdEfGhIjKlMnOpQrSt_-";
+
+/** Valid WebVTT of exactly `bytes` UTF-8 bytes, padded with 2-byte characters. */
+function vttOfBytes(bytes: number): string {
+  const prefix = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n";
+  const fill = bytes - utf8ByteLength(prefix) - 1;
+  return `${prefix}${"é".repeat(Math.floor(fill / 2))}${fill % 2 ? "a" : ""}\n`;
+}
+
+describe("utf8ByteLength", () => {
+  it.each([
+    ["", 0],
+    ["abc", 3],
+    ["é", 2],
+    ["€", 3],
+    ["გ", 3],
+    ["😀", 4],
+    ["a\uD800b", 5],
+  ])("measures %j as %i bytes", (text, bytes) => {
+    expect(utf8ByteLength(text)).toBe(bytes);
+  });
+});
+
+describe("subtitle.set", () => {
+  function subtitleSet(fields: Record<string, unknown> = {}) {
+    return {
+      type: "subtitle.set",
+      protocolVersion: ProtocolVersion,
+      name: "movie.en.srt",
+      content: vtt,
+      mediaMagnetUri: validMagnet,
+      ...fields,
+    };
+  }
+
+  it("accepts normalized WebVTT for the current media", () => {
+    expect(parseClientMessage(subtitleSet())).toEqual({ ok: true, message: subtitleSet() });
+  });
+
+  it("accepts content of exactly the byte limit, measured in UTF-8", () => {
+    const content = vttOfBytes(SHARED_SUBTITLE_MAX_BYTES);
+    expect(utf8ByteLength(content)).toBe(SHARED_SUBTITLE_MAX_BYTES);
+    expect(content.length).toBeLessThan(SHARED_SUBTITLE_MAX_BYTES);
+
+    expect(parseClientMessage(subtitleSet({ content })).ok).toBe(true);
+    expect(parseClientMessage(subtitleSet({ content: vttOfBytes(SHARED_SUBTITLE_MAX_BYTES + 1) })))
+      .toMatchObject({ ok: false, code: "invalid_message" });
+  });
+
+  it.each([
+    ["no WEBVTT header", "00:00:01.000 --> 00:00:02.000\nHello\n"],
+    ["a BOM", `\uFEFF${vtt}`],
+    ["CRLF line endings", vtt.replace(/\n/g, "\r\n")],
+    ["a NUL character", vtt.replace("Hello", "Hel\u0000lo")],
+    ["no trailing newline", vtt.trimEnd()],
+    ["no cue", "WEBVTT\n\nNOTE nothing\n"],
+    ["a non-string", 42],
+  ])("rejects content with %s", (_label, content) => {
+    expect(parseClientMessage(subtitleSet({ content }))).toMatchObject({
+      ok: false,
+      code: "invalid_message",
+    });
+  });
+
+  it("allows tabs in content", () => {
+    expect(parseClientMessage(subtitleSet({ content: vtt.replace("Hello", "a\tb") })).ok).toBe(
+      true,
+    );
+  });
+
+  it.each([
+    ["an empty name", ""],
+    ["a blank name", "   "],
+    ["a name with a newline", "movie\n.srt"],
+    ["a name with a DEL character", "movie\u007F.srt"],
+    ["a 256-character name", `${"a".repeat(252)}.srt`],
+  ])("rejects %s", (_label, name) => {
+    expect(parseClientMessage(subtitleSet({ name })).ok).toBe(false);
+  });
+
+  it("accepts a 255-character name with non-Latin characters", () => {
+    const name = `${"გ".repeat(251)}.srt`;
+    expect(parseClientMessage(subtitleSet({ name })).ok).toBe(true);
+  });
+
+  it.each([
+    ["missing media", { mediaMagnetUri: undefined }],
+    ["invalid media", { mediaMagnetUri: "https://example.com" }],
+    ["unknown keys", { id: subtitleId }],
+  ])("rejects %s", (_label, fields) => {
+    expect(parseClientMessage(subtitleSet(fields)).ok).toBe(false);
+  });
+
+  it("reports an older protocol version separately", () => {
+    expect(parseClientMessage(subtitleSet({ protocolVersion: 3 }))).toMatchObject({
+      ok: false,
+      code: "unsupported_version",
+    });
+  });
+});
+
+describe("subtitle.remove", () => {
+  it("accepts a subtitle id", () => {
+    const message = { type: "subtitle.remove", protocolVersion: ProtocolVersion, id: subtitleId };
+    expect(parseClientMessage(message)).toEqual({ ok: true, message });
+  });
+
+  it.each([
+    ["no id", {}],
+    ["a short id", { id: "abc" }],
+    ["an id with invalid characters", { id: "AbCdEfGhIjKlMnOpQrSt+/" }],
+    ["unknown keys", { id: subtitleId, name: "x.srt" }],
+  ])("rejects %s", (_label, fields) => {
+    expect(
+      parseClientMessage({ type: "subtitle.remove", protocolVersion: ProtocolVersion, ...fields })
+        .ok,
+    ).toBe(false);
+  });
+});
+
+describe("shared subtitle server messages", () => {
+  const metadata = { id: subtitleId, name: "movie.en.srt", sizeBytes: 1200, sharedBy: "p1" };
+
+  function snapshotWithSubtitle(subtitle: unknown) {
+    return {
+      type: "room.snapshot",
+      snapshot: {
+        roomId: validRoomId,
+        hostId: "p1",
+        participants: [{ id: "p1", displayName: "Ada", connected: true }],
+        media: { magnetUri: validMagnet, name: "movie.mp4", sizeBytes: 1024 },
+        playback: { status: "paused", positionSeconds: 0, updatedAtServerMs: 1, revision: 1 },
+        subtitle,
+      },
+    };
+  }
+
+  it("accepts subtitle metadata in a snapshot", () => {
+    expect(ServerMessageSchema.safeParse(snapshotWithSubtitle(metadata)).success).toBe(true);
+  });
+
+  it.each([
+    ["content in the snapshot", { ...metadata, content: vtt }],
+    ["a zero size", { ...metadata, sizeBytes: 0 }],
+    ["a size over the limit", { ...metadata, sizeBytes: SHARED_SUBTITLE_MAX_BYTES + 1 }],
+    ["an invalid id", { ...metadata, id: "nope" }],
+    ["a missing sharer", { id: subtitleId, name: "movie.en.srt", sizeBytes: 1200 }],
+  ])("rejects snapshot subtitle metadata with %s", (_label, subtitle) => {
+    expect(ServerMessageSchema.safeParse(snapshotWithSubtitle(subtitle)).success).toBe(false);
+  });
+
+  it("requires the subtitle field in snapshots", () => {
+    const message = snapshotWithSubtitle(null);
+    const { subtitle: _omitted, ...snapshot } = message.snapshot;
+    expect(ServerMessageSchema.safeParse({ ...message, snapshot }).success).toBe(false);
+  });
+
+  it("accepts subtitle.content with an id and WebVTT", () => {
+    expect(
+      ServerMessageSchema.safeParse({ type: "subtitle.content", id: subtitleId, content: vtt })
+        .success,
+    ).toBe(true);
+  });
+
+  it.each([
+    ["extra metadata", { id: subtitleId, content: vtt, name: "movie.en.srt" }],
+    ["an invalid id", { id: "x", content: vtt }],
+    ["invalid content", { id: subtitleId, content: "not vtt" }],
+  ])("rejects subtitle.content with %s", (_label, fields) => {
+    expect(ServerMessageSchema.safeParse({ type: "subtitle.content", ...fields }).success).toBe(
+      false,
+    );
+  });
+
+  it("accepts the media_changed error code", () => {
+    expect(
+      ServerMessageSchema.safeParse({ type: "error", code: "media_changed", message: "x" })
+        .success,
+    ).toBe(true);
   });
 });

@@ -7,21 +7,24 @@
  * harmless because expiry is decided here against the deadline.
  */
 import { isEquivalentPlayback } from "@swarmcue/playback-sync";
-import type {
-  Participant,
-  ParticipantId,
-  PlaybackState,
-  PlaybackStatus,
-  ResumeToken,
-  RoomId,
-  RoomSnapshot,
-  SharedMedia,
+import {
+  utf8ByteLength,
+  type Participant,
+  type ParticipantId,
+  type PlaybackState,
+  type PlaybackStatus,
+  type ResumeToken,
+  type RoomId,
+  type RoomSnapshot,
+  type SharedMedia,
+  type SubtitleId,
 } from "@swarmcue/protocol";
 
 export type RoomStoreOptions = {
   generateRoomId: () => RoomId;
   generateParticipantId: () => ParticipantId;
   generateResumeToken: () => ResumeToken;
+  generateSubtitleId: () => SubtitleId;
   /** One-way hash; the store keeps only hashes of resume tokens. */
   hashResumeToken: (token: ResumeToken) => string;
   maxParticipants: number;
@@ -95,6 +98,37 @@ export type SetPlaybackResult =
   | { ok: true; changed: boolean; snapshot: RoomSnapshot }
   | { ok: false; error: SetPlaybackError };
 
+export type SubtitleRequest = {
+  name: string;
+  /** Normalized WebVTT, already validated by the protocol schema. */
+  content: string;
+  /** The media the sender chose this subtitle for. */
+  mediaMagnetUri: string;
+};
+
+/** The text of the shared subtitle, delivered separately from snapshots. */
+export type SubtitleDelivery = { id: SubtitleId; content: string };
+
+export type SetSubtitleError = "room_not_found" | "not_in_room" | "no_media" | "media_changed";
+
+export type SetSubtitleResult =
+  | { ok: true; snapshot: RoomSnapshot; delivery: SubtitleDelivery }
+  | { ok: false; error: SetSubtitleError };
+
+export type RemoveSubtitleResult =
+  /** `changed` is false when there was nothing (or something newer) to remove. */
+  | { ok: true; changed: false }
+  | { ok: true; changed: true; snapshot: RoomSnapshot }
+  | { ok: false; error: "room_not_found" | "not_in_room" };
+
+type SharedSubtitleRecord = {
+  id: SubtitleId;
+  name: string;
+  sizeBytes: number;
+  sharedBy: ParticipantId;
+  content: string;
+};
+
 type ParticipantRecord = {
   id: ParticipantId;
   displayName: string;
@@ -111,6 +145,8 @@ type Room = {
   participants: ParticipantRecord[];
   media: SharedMedia | null;
   playback: PlaybackState;
+  /** Belongs to the current media; cleared when the media changes. */
+  subtitle: SharedSubtitleRecord | null;
 };
 
 const MAX_ROOM_ID_ATTEMPTS = 10;
@@ -130,7 +166,20 @@ export function createRoomStore(options: RoomStoreOptions) {
       })),
       media: room.media ? { ...room.media } : null,
       playback: { ...room.playback },
+      // Metadata only: the subtitle text is delivered in its own message.
+      subtitle: room.subtitle
+        ? {
+            id: room.subtitle.id,
+            name: room.subtitle.name,
+            sizeBytes: room.subtitle.sizeBytes,
+            sharedBy: room.subtitle.sharedBy,
+          }
+        : null,
     };
+  }
+
+  function isParticipant(room: Room, participantId: ParticipantId): boolean {
+    return room.participants.some((participant) => participant.id === participantId);
   }
 
   function generateUniqueRoomId(): RoomId {
@@ -222,6 +271,7 @@ export function createRoomStore(options: RoomStoreOptions) {
         participants: [record],
         media: null,
         playback: pausedAtStart(0),
+        subtitle: null,
       };
       rooms.set(room.id, room);
       return {
@@ -361,7 +411,7 @@ export function createRoomStore(options: RoomStoreOptions) {
 
     /**
      * Replace the shared media. Only the current host may do this. New media
-     * always starts paused at position 0.
+     * always starts paused at position 0, without the old media's subtitle.
      */
     setMedia(
       roomId: RoomId,
@@ -377,6 +427,7 @@ export function createRoomStore(options: RoomStoreOptions) {
       }
       room.media = { ...media };
       room.playback = pausedAtStart(room.playback.revision + 1);
+      room.subtitle = null;
       return { ok: true, snapshot: toSnapshot(room) };
     },
 
@@ -394,7 +445,7 @@ export function createRoomStore(options: RoomStoreOptions) {
       if (!room) {
         return { ok: false, error: "room_not_found" };
       }
-      if (!room.participants.some((participant) => participant.id === participantId)) {
+      if (!isParticipant(room, participantId)) {
         return { ok: false, error: "not_in_room" };
       }
       if (!room.media) {
@@ -412,6 +463,73 @@ export function createRoomStore(options: RoomStoreOptions) {
         revision: room.playback.revision + 1,
       };
       return { ok: true, changed: true, snapshot: toSnapshot(room) };
+    },
+
+    /**
+     * Share a subtitle for the current media, replacing any previous one.
+     * Any participant may do this in V1; the last one wins. Each call gets a
+     * new id, even for identical text.
+     */
+    setSubtitle(
+      roomId: RoomId,
+      participantId: ParticipantId,
+      request: SubtitleRequest,
+    ): SetSubtitleResult {
+      const room = rooms.get(roomId);
+      if (!room) {
+        return { ok: false, error: "room_not_found" };
+      }
+      if (!isParticipant(room, participantId)) {
+        return { ok: false, error: "not_in_room" };
+      }
+      if (!room.media) {
+        return { ok: false, error: "no_media" };
+      }
+      // Chosen for media that has since been replaced: it must not attach to the new one.
+      if (room.media.magnetUri !== request.mediaMagnetUri) {
+        return { ok: false, error: "media_changed" };
+      }
+      room.subtitle = {
+        id: options.generateSubtitleId(),
+        name: request.name,
+        sizeBytes: utf8ByteLength(request.content),
+        sharedBy: participantId,
+        content: request.content,
+      };
+      return {
+        ok: true,
+        snapshot: toSnapshot(room),
+        delivery: { id: room.subtitle.id, content: room.subtitle.content },
+      };
+    },
+
+    /**
+     * Remove the shared subtitle for everyone, but only if it is still the one
+     * the sender saw (`subtitleId`). Otherwise nothing changes.
+     */
+    removeSubtitle(
+      roomId: RoomId,
+      participantId: ParticipantId,
+      subtitleId: SubtitleId,
+    ): RemoveSubtitleResult {
+      const room = rooms.get(roomId);
+      if (!room) {
+        return { ok: false, error: "room_not_found" };
+      }
+      if (!isParticipant(room, participantId)) {
+        return { ok: false, error: "not_in_room" };
+      }
+      if (room.subtitle?.id !== subtitleId) {
+        return { ok: true, changed: false };
+      }
+      room.subtitle = null;
+      return { ok: true, changed: true, snapshot: toSnapshot(room) };
+    },
+
+    /** The current subtitle text, for participants who join or resume. */
+    getSubtitleDelivery(roomId: RoomId): SubtitleDelivery | null {
+      const subtitle = rooms.get(roomId)?.subtitle;
+      return subtitle ? { id: subtitle.id, content: subtitle.content } : null;
     },
 
     getSnapshot(roomId: RoomId): RoomSnapshot | null {

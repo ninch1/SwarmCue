@@ -110,7 +110,7 @@ The coordination server is responsible for:
 - Sending complete room snapshots to joining or reconnecting participants.
 - Handling disconnections and host reconnection grace periods.
 - Transferring host ownership when the previous host does not return.
-- Managing shared subtitle metadata.
+- Holding the room's shared subtitle (metadata and WebVTT text, in memory only) and delivering it to participants.
 - Removing abandoned or expired rooms.
 - Rejecting malformed, unauthorized, or excessive client messages.
 
@@ -127,11 +127,11 @@ Shared room state is authoritative on the coordination server. A client may requ
 | Selected media                        | Coordination server           |
 | Shared playback state                 | Coordination server           |
 | Pending pause requests                | Coordination server           |
-| Shared subtitle selection             | Coordination server           |
+| Shared room subtitle                  | Coordination server           |
 | Local playback position               | Browser client                |
 | Local buffering and readiness         | Browser client                |
 | Torrent progress and peer information | Browser client and WebTorrent |
-| Personal subtitle selection           | Browser client                |
+| Personal subtitle; which one is shown | Browser client                |
 | Media bytes                           | Participating peers           |
 
 Clients send commands that express intentions, such as requesting playback, pause, or seeking. The server validates these commands, updates its authoritative state, and broadcasts accepted changes.
@@ -206,16 +206,40 @@ The room's playback state is `{ status, positionSeconds, updatedAtServerMs, revi
 - **Drift correction (seek only).** While the room is playing, each client checks its position every second and seeks to the expected position when it is more than 0.5 s off. Checks are skipped while seeking or buffering, and corrective seeks have a 3 s cooldown. Expected server time comes from clock estimation; until the first estimate, a client uses its own clock.
 - **Local actions.** A user's play, pause, and seek are reported as commands; events caused by applying room state are ignored. A change counts as the user's only when it follows a recent user gesture (`navigator.userActivation.isActive`), because browsers also pause and resume media on their own (for example, Chrome pauses muted playback that started without a gesture when it is offscreen). Browser-initiated pauses stay local, and a browser-initiated resume while the room is paused is reverted. Reaching the end of the media always pauses the room. Pressing play while the room is already playing (for example after the browser blocked autoplay) rejoins the room's position instead of restarting it.
 
-### Personal subtitles
+### Subtitles
 
-A participant can add a local `.srt` or `.vtt` file to the video they are watching. It stays in their browser: nothing is sent to the server or other participants, and it never changes room playback.
+Subtitles never change room playback. There are two kinds, and each participant sees at most one at a time:
+
+- **Personal subtitles** stay in the participant's browser; nothing is sent anywhere.
+- **The room subtitle** is shared by any participant with everyone in the room. Each participant decides locally whether to show it.
+
+Both start as a local `.srt` or `.vtt` file and use the same client-side pipeline:
 
 - **Validation.** The file extension decides the format (MIME types are unreliable for local subtitles). Files over 1 MiB are rejected before being read; typical feature-length subtitles are 50–250 KB. Text must be UTF-8, because browsers cannot reliably detect legacy encodings.
 - **Normalization.** A pure module converts SRT to WebVTT (optional cue numbers, comma or dot milliseconds, any hour count, multiline text; malformed blocks are skipped and counted) and keeps WebVTT as written apart from the BOM and line endings. Text starting with a `WEBVTT` header is treated as WebVTT whatever its extension. SRT `<i>`, `<b>`, `<u>` are kept; `<font>` and `{\an8}`-style overrides are dropped, so their colors and positions are not supported.
-- **Rendering.** The normalized WebVTT becomes a `Blob` object URL attached as a native `<track kind="subtitles">`, so the browser keeps cues on the media timeline through seeks, drift corrections, and resyncs, and shows them in native fullscreen. SwarmCue has its own compact control (add, show/hide, replace, remove); the browser's captions menu stays in step with it. Styling is limited to `::cue`, and OS caption preferences may override it.
-- **Lifecycle.** A subtitle belongs to what the player shows: a picked local file, or a stream identified by its torrent. It is removed (and its object URL revoked) when the room's media changes, the host picks another file, or the participant leaves or enters another room. A reconnect keeps it. Subtitles are not stored, so a refresh loses them.
+- **Rendering.** The normalized WebVTT becomes a `Blob` object URL attached as a single native `<track kind="subtitles">`, so the browser keeps cues on the media timeline through seeks, drift corrections, and resyncs, and shows them in native fullscreen. Styling is limited to `::cue`, and OS caption preferences may override it.
 
-ASS/SSA files and shared (room-wide) subtitles are not part of this. Shared subtitles should reuse the normalized WebVTT and the same rendering path, travel in their own message rather than in room snapshots, and leave each participant free to show or hide them.
+#### Sharing a subtitle with the room
+
+- **Transport.** The normalized WebVTT is sent as text over the coordination WebSocket (`subtitle.set { name, content, mediaMagnetUri }`), not through a separate torrent: subtitle files are small, and the server can hand them to late joiners and returning participants without any peer being online. The video itself still never touches the server.
+- **Server memory, not storage.** The room keeps the current subtitle (id, name, UTF-8 size, who shared it, and the text) in memory only. Its text temporarily passes through and resides in the coordination server's memory until it is replaced, removed, cleared by new media, or the room or server process goes away. It is never written to disk or logged, and whoever runs the server could read it, so deployments must use `wss://`.
+- **Snapshots carry metadata only.** `room.snapshot` includes `subtitle: { id, name, sizeBytes, sharedBy } | null`. The text travels in a dedicated `subtitle.content { id, content }` message, so playback updates never resend it. The server sends that message after the snapshot naming the id: to everyone when a subtitle is set, and to a participant right after `room.joined` or `room.resumed`.
+- **Consistency.** Every share gets a new server-generated id. A client uses `subtitle.content` only while its latest snapshot names the same id, and drops the text when a snapshot names another id or none. A stale or repeated message therefore cannot restore a removed or replaced subtitle, and redelivery after a resume is ignored.
+- **Permissions and races.** Any participant may set, replace, or remove the room subtitle; the last write wins. `subtitle.set` names the media it was chosen for and is rejected with `media_changed` if the room's media changed in the meantime. `subtitle.remove { id }` only removes that id, so nobody removes a subtitle they have not seen. Commands from a replaced connection are rejected like any other room command.
+- **Lifecycle.** New media clears the room subtitle. Disconnects, resumes, leaving, and host transfer keep it. It disappears with the room, and with every room on a server restart. Re-picking the same file as host (no `media.set`) keeps it.
+- **Limits.** Shared text is at most 512 KiB of UTF-8, enforced by the client before sending and by the protocol schema on the server (in UTF-8 bytes, not characters). The server also checks the overall WebVTT shape (header, LF line endings, no control characters other than tab and newline, at least one cue) without parsing cues. WebSocket messages are capped at 1 MiB + 8 KiB (`maxPayload`): enough for the largest subtitle after JSON escaping, which at most doubles it. A larger frame closes the connection (code 1009) before it is parsed; oversized text that fits in a frame is rejected with `invalid_message`.
+
+#### Choosing what to see
+
+Each participant's selection is local: off, the room subtitle, or their own.
+
+- Picking a personal file shows it. Removing it turns subtitles off rather than switching to the room subtitle, which may be in another language.
+- A new room subtitle turns on by itself only for someone who is neither using their own subtitle nor has turned subtitles off; someone using their own is told that a new one was shared. The sharer sees what they shared.
+- "Off" only affects this participant. Removing the room subtitle for everyone is a separate action, labeled as such.
+- The room subtitle is offered only while the player shows the room's media (not a host's private preview of a file that is not shared yet).
+- Object URLs: personal subtitles keep theirs while another source is shown; the room subtitle gets one URL per id, revoked when it is replaced or removed. Nothing is revoked just by switching sources.
+
+Personal subtitles belong to what the player shows: a picked local file, or a stream identified by its torrent. They are removed (and their object URL revoked) when the room's media changes, the host picks another file, or the participant leaves or enters another room. A reconnect keeps both kinds. A refresh loses personal subtitles; the room subtitle comes back from the server.
 
 ### Playback control (V1)
 
@@ -293,14 +317,17 @@ Vitest is the test runner. Specific remaining library choices (for example WebTo
 - Peer discovery depends on available WebTorrent-compatible trackers.
 - Browsers cannot connect to ordinary BitTorrent swarms (TCP/UDP peers, `udp://` trackers), so public torrents are not supported.
 - SwarmCue does not provide server-side transcoding or media fallback.
-- Personal subtitles are lost on refresh, must be UTF-8, and are cleared if a host who refreshed re-picks their file (the player switches from the stream to the local file).
+- Personal subtitles are lost on refresh, must be UTF-8, and are cleared if a host who refreshed re-picks their file (the player switches from the stream to the local file). The room subtitle survives both.
+- A room has one shared subtitle at a time (no per-language list), limited to 512 KiB, while personal subtitles may be up to 1 MiB. There is no timing offset.
+- Raising the WebSocket message limit to about 1 MiB for subtitles means each connection can make the server buffer that much per message; rate and connection limits are still deferred (see `docs/todo.md`).
+- A large `subtitle.content` message briefly delays that client's clock pong; the clock estimate keeps the lowest-round-trip sample, so one slow sample is outweighed.
 
 ## Out of Scope for V1
 
 - Arbitrary user-provided magnet links.
 - Public torrent swarms.
 - A media queue; a room has one current media item.
-- ASS/SSA subtitles; V1 subtitles are `.srt` and `.vtt`.
+- Subtitle formats other than `.srt` and `.vtt`: ASS/SSA, image-based subtitles (PGS, VobSub), and subtitles embedded in the video container (e.g. MKV tracks).
 - A desktop or native companion application that bridges conventional TCP/UDP BitTorrent swarms to browser WebRTC peers.
 - Acting as a general browser torrent client.
 
@@ -312,5 +339,4 @@ The following decisions will be made during implementation and testing:
 - Whether minor drift should use temporary playback-rate adjustment instead of seeking (V1 currently seeks only).
 - Final reconnection timings. The starting values (30 s grace, 15 s heartbeat, 500 ms to 5 s backoff, 60 s client give-up) should be tuned through testing.
 - Room expiration duration.
-- Shared subtitle distribution method.
 - WebTorrent tracker selection and fallback behavior.

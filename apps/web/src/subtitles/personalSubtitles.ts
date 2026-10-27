@@ -4,9 +4,8 @@ export type PersonalSubtitle = {
   /** New for every successfully loaded file, including the same file picked again. */
   id: number;
   fileName: string;
-  /** Object URL of the normalized WebVTT text. */
+  /** Object URL of the normalized WebVTT text; kept while another source is shown. */
   url: string;
-  enabled: boolean;
   cueCount: number;
   skippedBlocks: number;
 };
@@ -31,7 +30,6 @@ export type PersonalSubtitles = {
   getState: () => PersonalSubtitleState;
   /** Load a file, replacing the current subtitle only if it is valid. */
   select: (file: File) => Promise<void>;
-  setEnabled: (enabled: boolean) => void;
   remove: () => void;
   /** The media changed: drop the subtitle, its error, and any read in flight. */
   reset: () => void;
@@ -47,8 +45,10 @@ export const emptyPersonalSubtitleState: PersonalSubtitleState = {
 
 /**
  * Personal subtitles stay in this browser tab. This controller owns the one
- * object URL of the active subtitle and revokes it whenever the subtitle is
- * replaced, removed, reset, or disposed. It never touches the video or the room.
+ * object URL of the personal subtitle and revokes it whenever the subtitle is
+ * replaced, removed, reset, or disposed (not when another source is shown).
+ * It never touches the video or the room; whether it is visible is decided
+ * by the subtitle selection.
  */
 export function createPersonalSubtitles(deps: PersonalSubtitlesDeps): PersonalSubtitles {
   let state = emptyPersonalSubtitleState;
@@ -110,7 +110,6 @@ export function createPersonalSubtitles(deps: PersonalSubtitlesDeps): PersonalSu
           id: nextId++,
           fileName: file.name,
           url: deps.createObjectUrl(result.subtitle.vtt),
-          enabled: true,
           cueCount: result.subtitle.cueCount,
           skippedBlocks: result.subtitle.skippedBlocks,
         },
@@ -119,12 +118,6 @@ export function createPersonalSubtitles(deps: PersonalSubtitlesDeps): PersonalSu
       });
       if (previous) {
         deps.revokeObjectUrl(previous.url);
-      }
-    },
-
-    setEnabled(enabled) {
-      if (!disposed && state.subtitle && state.subtitle.enabled !== enabled) {
-        setState({ ...state, subtitle: { ...state.subtitle, enabled } });
       }
     },
 

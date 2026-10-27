@@ -1,11 +1,16 @@
-import type { PlaybackStatus, SharedMedia } from "@swarmcue/protocol";
+import type { PlaybackStatus, SharedMedia, SubtitleId } from "@swarmcue/protocol";
 import { useEffect, useRef, useState } from "react";
 import { startClockSync } from "../clock/clockSync.js";
 import { openRoomConnection } from "./connection.js";
-import { createRoomSession, type RoomSession, type RoomState } from "./roomSession.js";
+import {
+  createRoomSession,
+  type RoomSession,
+  type RoomState,
+  type SubtitleShareRequest,
+} from "./roomSession.js";
 import { browserSessionStorage, createSessionStore } from "./sessionStore.js";
 
-export type { RoomState } from "./roomSession.js";
+export type { RoomState, SubtitleShareRequest } from "./roomSession.js";
 
 export type UseRoom = {
   state: RoomState;
@@ -23,6 +28,10 @@ export type UseRoom = {
    * sent, otherwise null.
    */
   setPlayback: (status: PlaybackStatus, positionSeconds: number) => string | null;
+  /** Any participant: share a subtitle with the room. Returns a message when it cannot be sent. */
+  setSubtitle: (request: SubtitleShareRequest) => string | null;
+  /** Any participant: remove the shared subtitle `id` for everyone. */
+  removeSubtitle: (id: SubtitleId) => string | null;
   /**
    * Estimated current server time in epoch ms, or null before the clock has
    * been measured. Local-only; never sent as room state.
@@ -89,6 +98,10 @@ export function useRoom(): UseRoom {
       sessionRef.current
         ? sessionRef.current.setPlayback(status, positionSeconds)
         : NOT_READY,
+    setSubtitle: (request) =>
+      sessionRef.current ? sessionRef.current.setSubtitle(request) : NOT_READY,
+    removeSubtitle: (id) =>
+      sessionRef.current ? sessionRef.current.removeSubtitle(id) : NOT_READY,
     estimateServerNowMs: () => sessionRef.current?.estimateServerNowMs() ?? null,
   };
 }

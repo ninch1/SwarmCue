@@ -4,11 +4,12 @@ import {
   usePlaybackSync,
   type LocalPlaybackChange,
 } from "../player/usePlaybackSync.js";
+import { applyDefaultCueLine } from "../subtitles/cuePosition.js";
 
 /** A WebVTT subtitle shown through the video's native text-track rendering. */
 export type VideoSubtitle = {
-  /** A new id means a new <track> element. */
-  id: number;
+  /** A new id means a new <track> element, e.g. "personal:3" or "shared:<id>". */
+  id: string;
   url: string;
   label: string;
   enabled: boolean;
@@ -71,6 +72,24 @@ export function VideoPlayer({
       textTrack.mode = mode;
     }
   }, [src, subtitleId, subtitleEnabled]);
+
+  // Keep cues at a steady height instead of jumping with the native controls.
+  // Cues from a Blob URL may already be loaded when this runs, or arrive
+  // later with the track's `load` event.
+  useEffect(() => {
+    const trackElement = trackRef.current;
+    if (!trackElement) {
+      return;
+    }
+    const positionCues = () => {
+      applyDefaultCueLine(trackElement.track?.cues);
+    };
+    positionCues();
+    trackElement.addEventListener("load", positionCues);
+    return () => {
+      trackElement.removeEventListener("load", positionCues);
+    };
+  }, [src, subtitleId]);
 
   // Native controls have their own captions menu; keep our toggle in step with it.
   useEffect(() => {
