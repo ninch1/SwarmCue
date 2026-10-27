@@ -21,12 +21,20 @@ export type ClockSyncOptions = {
   /** How long to wait for each pong; also the largest round trip accepted. */
   sampleTimeoutMs?: number;
   resyncIntervalMs?: number;
+  /**
+   * Estimate to use until this session's first round produces a sample, e.g.
+   * the previous connection's estimate after a reconnect. Offsets are anchored
+   * to the monotonic clock, so they stay meaningful across connections.
+   */
+  initialEstimate?: ClockSample | null;
 };
 
 export type ClockSync = {
   handlePong: (pong: { id: number; serverTimeMs: number }) => void;
   /** Estimated server epoch ms, or null until a round has produced a sample. */
   estimateServerNowMs: () => number | null;
+  /** The sample behind the current estimate, to seed a later session. */
+  currentSample: () => ClockSample | null;
   /** Start a measurement round now, unless one is already running. */
   resyncNow: () => void;
   /** Stop timers and ignore any later pongs. The session cannot be restarted. */
@@ -57,10 +65,11 @@ export function startClockSync(options: ClockSyncOptions): ClockSync {
     samplesPerRound = DEFAULT_SAMPLES_PER_ROUND,
     sampleTimeoutMs = DEFAULT_SAMPLE_TIMEOUT_MS,
     resyncIntervalMs = DEFAULT_RESYNC_INTERVAL_MS,
+    initialEstimate = null,
   } = options;
 
   let disposed = false;
-  let estimate: ClockSample | null = null;
+  let estimate: ClockSample | null = initialEstimate;
   /** Samples collected by the running round; null when no round is running. */
   let roundSamples: ClockSample[] | null = null;
   let pingsLeftInRound = 0;
@@ -156,6 +165,10 @@ export function startClockSync(options: ClockSyncOptions): ClockSync {
 
     estimateServerNowMs() {
       return estimate ? estimateServerTimeMs(estimate, monotonicNow()) : null;
+    },
+
+    currentSample() {
+      return estimate;
     },
 
     resyncNow() {

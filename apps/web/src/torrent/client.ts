@@ -13,6 +13,8 @@ const BROWSER_TRACKERS = [
 
 /** Served from the site root by the Vite plugin in vite.config.ts. */
 const SERVICE_WORKER_URL = "/webtorrent-sw.js";
+/** Asks the active worker to control this page; handled by the snippet in vite.config.ts. */
+const CLAIM_MESSAGE = "swarmcue:claim";
 const CONTROLLER_TIMEOUT_MS = 5000;
 const STATS_INTERVAL_MS = 1000;
 
@@ -97,7 +99,7 @@ function supersededError(): Error {
   return new Error("Superseded by a newer torrent request.");
 }
 
-function waitForController(): Promise<void> {
+function waitForController(registration: ServiceWorkerRegistration): Promise<void> {
   if (navigator.serviceWorker.controller) {
     return Promise.resolve();
   }
@@ -124,6 +126,9 @@ function waitForController(): Promise<void> {
       onControllerChange,
       { once: true },
     );
+    // The worker only claims pages on activation; a page loaded uncontrolled
+    // while it is already active (e.g. a hard reload) must ask explicitly.
+    registration.active?.postMessage(CLAIM_MESSAGE);
   });
 }
 
@@ -144,7 +149,7 @@ function ensureStreamServer(torrentClient: WebTorrent): Promise<void> {
         scope: "/",
       });
       const registration = await navigator.serviceWorker.ready;
-      await waitForController();
+      await waitForController(registration);
       torrentClient.createServer({ controller: registration }, "browser");
     })();
     streamServerReady.catch(() => {

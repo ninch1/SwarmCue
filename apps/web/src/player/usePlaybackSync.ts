@@ -18,6 +18,12 @@ export type LocalPlaybackChange = {
 };
 
 export type PlaybackSyncOptions = {
+  /**
+   * Changes when the room connection is (re-)established. Room state is
+   * re-applied then even if its revision is unchanged, so local changes made
+   * while disconnected are reverted.
+   */
+  resyncKey: number | null;
   /** Estimated current server time in epoch ms. */
   getServerNowMs: () => number;
   /** Called when this user plays, pauses, or seeks. */
@@ -60,7 +66,7 @@ export function usePlaybackSync(
   videoRef: RefObject<HTMLVideoElement | null>,
   src: string | null,
   playback: PlaybackState | null,
-  { getServerNowMs, onLocalChange }: PlaybackSyncOptions,
+  { resyncKey, getServerNowMs, onLocalChange }: PlaybackSyncOptions,
 ): PlaybackSync {
   const [blocked, setBlocked] = useState(false);
   /** Status we are applying from the room; its matching event is not re-sent. */
@@ -181,7 +187,7 @@ export function usePlaybackSync(
   const status = playback?.status ?? null;
   const revision = playback?.revision ?? null;
 
-  // Apply each new room revision.
+  // Apply each new room revision, and the current one after every (re)connect.
   useEffect(() => {
     const video = videoRef.current;
     if (!video || status === null) {
@@ -209,7 +215,7 @@ export function usePlaybackSync(
         // AbortError means a pause interrupted play(); nothing to do.
       });
     }
-  }, [videoRef, src, status, revision]);
+  }, [videoRef, src, status, revision, resyncKey]);
 
   // Drift correction while the room is playing.
   useEffect(() => {

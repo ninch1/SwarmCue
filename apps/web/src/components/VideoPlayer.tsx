@@ -11,6 +11,8 @@ type VideoPlayerProps = {
   emptyMessage: string;
   /** The room's playback timeline; null outside a room. */
   playback: PlaybackState | null;
+  /** Changes on every join or resume, so room state is re-applied after a reconnect. */
+  resyncKey: number | null;
   /** Estimated current server time in epoch ms. */
   getServerNowMs: () => number;
   /** Called when this user plays, pauses, or seeks the video. */
@@ -22,12 +24,14 @@ export function VideoPlayer({
   src,
   emptyMessage,
   playback,
+  resyncKey,
   getServerNowMs,
   onLocalPlaybackChange,
   onError,
 }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const { blocked } = usePlaybackSync(videoRef, src, playback, {
+    resyncKey,
     getServerNowMs,
     onLocalChange: onLocalPlaybackChange,
   });

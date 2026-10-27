@@ -7,7 +7,8 @@ import {
 export type RoomConnectionHandlers = {
   onOpen: () => void;
   onMessage: (message: ServerMessage) => void;
-  onClose: () => void;
+  /** `code` is the WebSocket close code (e.g. 4000 when the session was resumed elsewhere). */
+  onClose: (code: number) => void;
 };
 
 export type RoomConnection = {
@@ -28,7 +29,7 @@ export function openRoomConnection(
   const socket = new WebSocket(roomServerUrl());
 
   socket.addEventListener("open", handlers.onOpen);
-  socket.addEventListener("close", handlers.onClose);
+  socket.addEventListener("close", (event) => handlers.onClose(event.code));
   socket.addEventListener("message", (event: MessageEvent<unknown>) => {
     if (typeof event.data !== "string") {
       console.error("Ignoring non-text message from room server.");
@@ -52,7 +53,11 @@ export function openRoomConnection(
   });
 
   return {
-    send: (message) => socket.send(JSON.stringify(message)),
+    send: (message) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(message));
+      }
+    },
     close: () => socket.close(),
   };
 }

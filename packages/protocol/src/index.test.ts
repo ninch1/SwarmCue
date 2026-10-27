@@ -10,6 +10,8 @@ import {
 const validRoomId = "K7QM3XPD";
 const hexHash = "c9e15763f722f23e98a29decdfae341b98d53056";
 const validMagnet = `magnet:?xt=urn:btih:${hexHash}&dn=movie.mp4`;
+/** 43 base64url characters, the encoding of 32 random bytes. */
+const validToken = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_AbCdE";
 
 function mediaSet(media: unknown) {
   return { type: "media.set", protocolVersion: ProtocolVersion, media };
@@ -202,6 +204,64 @@ describe("playback.set", () => {
   });
 });
 
+describe("room.resume", () => {
+  function resume(fields: Record<string, unknown>) {
+    return {
+      type: "room.resume",
+      protocolVersion: ProtocolVersion,
+      roomId: validRoomId,
+      resumeToken: validToken,
+      ...fields,
+    };
+  }
+
+  it("accepts a well-formed resume", () => {
+    expect(parseClientMessage(resume({}))).toEqual({ ok: true, message: resume({}) });
+  });
+
+  it.each([
+    ["short token", { resumeToken: validToken.slice(1) }],
+    ["long token", { resumeToken: `${validToken}A` }],
+    ["token with invalid characters", { resumeToken: `${validToken.slice(1)}=` }],
+    ["missing token", { resumeToken: undefined }],
+    ["numeric token", { resumeToken: 42 }],
+    ["missing room id", { roomId: undefined }],
+    ["invalid room id", { roomId: "k7qm3xpd" }],
+    ["participant id instead of token", { participantId: "p1" }],
+  ])("rejects %s", (_label, fields) => {
+    const result = parseClientMessage(resume(fields));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("invalid_message");
+    }
+  });
+
+  it("reports an older protocol version as unsupported_version", () => {
+    const result = parseClientMessage(resume({ protocolVersion: 2 }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("unsupported_version");
+    }
+  });
+});
+
+describe("room.leave", () => {
+  it("accepts a leave command", () => {
+    expect(
+      parseClientMessage({ type: "room.leave", protocolVersion: ProtocolVersion }).ok,
+    ).toBe(true);
+  });
+
+  it("rejects extra keys", () => {
+    const result = parseClientMessage({
+      type: "room.leave",
+      protocolVersion: ProtocolVersion,
+      participantId: "p1",
+    });
+    expect(result.ok).toBe(false);
+  });
+});
+
 describe("clock.ping", () => {
   function clockPing(fields: Record<string, unknown>) {
     return { type: "clock.ping", protocolVersion: ProtocolVersion, ...fields };
@@ -284,7 +344,7 @@ describe("ServerMessageSchema", () => {
       snapshot: {
         roomId: validRoomId,
         hostId: "p1",
-        participants: [{ id: "p1", displayName: "Ada" }],
+        participants: [{ id: "p1", displayName: "Ada", connected: true }],
         media: null,
         playback,
       },
@@ -295,10 +355,11 @@ describe("ServerMessageSchema", () => {
     const result = ServerMessageSchema.safeParse({
       type: "room.joined",
       selfId: "p1",
+      resumeToken: validToken,
       snapshot: {
         roomId: validRoomId,
         hostId: "p1",
-        participants: [{ id: "p1", displayName: "Ada" }],
+        participants: [{ id: "p1", displayName: "Ada", connected: true }],
         media: { magnetUri: validMagnet, name: "movie.mp4", sizeBytes: 1024 },
         playback: { ...pausedPlayback, status: "playing", positionSeconds: 42.5, revision: 3 },
       },
@@ -325,7 +386,7 @@ describe("ServerMessageSchema", () => {
       snapshot: {
         roomId: validRoomId,
         hostId: "p1",
-        participants: [{ id: "p1", displayName: "Ada" }],
+        participants: [{ id: "p1", displayName: "Ada", connected: true }],
         media: null,
       },
     });
@@ -339,7 +400,7 @@ describe("ServerMessageSchema", () => {
       snapshot: {
         roomId: validRoomId,
         hostId: "p1",
-        participants: [{ id: "p1", displayName: "Ada" }],
+        participants: [{ id: "p1", displayName: "Ada", connected: true }],
         media: null,
         playback: { ...pausedPlayback, revision: -1 },
       },
@@ -354,13 +415,54 @@ describe("ServerMessageSchema", () => {
       snapshot: {
         roomId: validRoomId,
         hostId: "p2",
-        participants: [{ id: "p1", displayName: "Ada" }],
+        participants: [{ id: "p1", displayName: "Ada", connected: true }],
         media: null,
         playback: pausedPlayback,
       },
     });
 
     expect(result.success).toBe(false);
+  });
+
+  it("rejects room.joined without a resume token", () => {
+    const { snapshot } = snapshotWithPlayback(pausedPlayback);
+    expect(
+      ServerMessageSchema.safeParse({ type: "room.joined", selfId: "p1", snapshot }).success,
+    ).toBe(false);
+  });
+
+  it("accepts room.resumed, which carries no token", () => {
+    const { snapshot } = snapshotWithPlayback(pausedPlayback);
+    expect(
+      ServerMessageSchema.safeParse({ type: "room.resumed", selfId: "p1", snapshot }).success,
+    ).toBe(true);
+    expect(
+      ServerMessageSchema.safeParse({
+        type: "room.resumed",
+        selfId: "p1",
+        resumeToken: validToken,
+        snapshot,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires a connection status on every participant", () => {
+    const message = snapshotWithPlayback(pausedPlayback);
+    expect(
+      ServerMessageSchema.safeParse({
+        ...message,
+        snapshot: {
+          ...message.snapshot,
+          participants: [{ id: "p1", displayName: "Ada" }],
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it.each(["resume_rejected", "session_replaced"])("accepts the %s error code", (code) => {
+    expect(
+      ServerMessageSchema.safeParse({ type: "error", code, message: "x" }).success,
+    ).toBe(true);
   });
 
   it("rejects an unknown error code", () => {

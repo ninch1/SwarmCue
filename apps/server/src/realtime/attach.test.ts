@@ -8,9 +8,43 @@ import {
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { createCoordinationServer, type CoordinationServer } from "../server.js";
+import { SESSION_REPLACED_CLOSE_CODE, type Scheduler } from "./attach.js";
 
 const MESSAGE_TIMEOUT_MS = 2000;
 const SERVER_NOW_MS = 1_700_000_000_000;
+const GRACE_MS = 30_000;
+
+/** Server clock; tests advance it explicitly. Reset before each test. */
+const serverClock = { nowMs: SERVER_NOW_MS };
+
+type FakeTimer = { callback: () => void; atMs: number; cancelled: boolean };
+
+/** Records timers instead of running them; `runDue()` fires those whose time has come. */
+function createFakeScheduler() {
+  const timers: FakeTimer[] = [];
+  const scheduler: Scheduler = {
+    setTimer: (callback, delayMs) => {
+      const timer = { callback, atMs: serverClock.nowMs + delayMs, cancelled: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimer: (handle) => {
+      (handle as FakeTimer).cancelled = true;
+    },
+  };
+  return {
+    scheduler,
+    pending: () => timers.filter((timer) => !timer.cancelled),
+    runDue: () => {
+      for (const timer of [...timers]) {
+        if (!timer.cancelled && timer.atMs <= serverClock.nowMs) {
+          timer.cancelled = true;
+          timer.callback();
+        }
+      }
+    },
+  };
+}
 const initialPlayback = {
   status: "paused",
   positionSeconds: 0,
@@ -36,12 +70,24 @@ function playbackSet(status: "playing" | "paused", positionSeconds = 0) {
   return { type: "playback.set", protocolVersion: ProtocolVersion, status, positionSeconds };
 }
 
+async function waitFor(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + MESSAGE_TIMEOUT_MS;
+  while (!condition()) {
+    if (Date.now() > deadline) {
+      throw new Error("Timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 type TestClient = {
   socket: WebSocket;
   send: (message: unknown) => void;
   sendRaw: (data: string) => void;
   next: () => Promise<ServerMessage>;
   close: () => Promise<void>;
+  /** Resolves with the close code once the server closes this socket. */
+  closed: Promise<number>;
 };
 
 async function connect(url: string): Promise<TestClient> {
@@ -60,10 +106,14 @@ async function connect(url: string): Promise<TestClient> {
     }
   });
 
+  const closed = new Promise<number>((resolve) => {
+    socket.once("close", (code) => resolve(code));
+  });
   await once(socket, "open");
 
   return {
     socket,
+    closed,
     send: (message) => socket.send(JSON.stringify(message)),
     sendRaw: (data) => socket.send(data),
     next: () =>
@@ -95,6 +145,7 @@ async function connect(url: string): Promise<TestClient> {
 
 describe("realtime rooms", () => {
   let coordination: CoordinationServer;
+  let fakeScheduler: ReturnType<typeof createFakeScheduler>;
   let url: string;
   const clients: TestClient[] = [];
 
@@ -126,8 +177,15 @@ describe("realtime rooms", () => {
       host,
       viewer,
       roomId: created.snapshot.roomId,
+      hostId: created.selfId,
       viewerId: joined.selfId,
+      hostToken: created.resumeToken,
+      viewerToken: joined.resumeToken,
     };
+  }
+
+  function resumeMessage(roomId: string, resumeToken: string) {
+    return { type: "room.resume", protocolVersion: ProtocolVersion, roomId, resumeToken };
   }
 
   /** hostAndViewer, plus shared media; the media snapshots are consumed. */
@@ -139,15 +197,22 @@ describe("realtime rooms", () => {
     return room;
   }
 
-  beforeEach(async () => {
-    coordination = createCoordinationServer({ now: () => SERVER_NOW_MS });
+  /** Heartbeat is off by default so tests control every scheduled timer. */
+  async function startServer(heartbeatIntervalMs = 0): Promise<void> {
+    fakeScheduler = createFakeScheduler();
+    coordination = createCoordinationServer({
+      now: () => serverClock.nowMs,
+      graceMs: GRACE_MS,
+      scheduler: fakeScheduler.scheduler,
+      heartbeatIntervalMs,
+    });
     coordination.server.listen(0, "127.0.0.1");
     await once(coordination.server, "listening");
     const { port } = coordination.server.address() as AddressInfo;
     url = `ws://127.0.0.1:${port}/ws`;
-  });
+  }
 
-  afterEach(async () => {
+  async function stopServer(): Promise<void> {
     await Promise.all(clients.splice(0).map((created) => created.close()));
     for (const socket of coordination.wss.clients) {
       socket.terminate();
@@ -156,7 +221,14 @@ describe("realtime rooms", () => {
     await new Promise<void>((resolve, reject) => {
       coordination.server.close((error) => (error ? reject(error) : resolve()));
     });
+  }
+
+  beforeEach(async () => {
+    serverClock.nowMs = SERVER_NOW_MS;
+    await startServer();
   });
+
+  afterEach(stopServer);
 
   it("gives two clients the same participant state", async () => {
     const ada = await client();
@@ -165,7 +237,7 @@ describe("realtime rooms", () => {
     expect(created.type).toBe("room.joined");
     if (created.type !== "room.joined") return;
     expect(created.snapshot.participants).toEqual([
-      { id: created.selfId, displayName: "Ada" },
+      { id: created.selfId, displayName: "Ada", connected: true },
     ]);
 
     const grace = await client();
@@ -183,57 +255,59 @@ describe("realtime rooms", () => {
     if (joined.type !== "room.joined" || update.type !== "room.snapshot") return;
 
     expect(joined.snapshot.participants).toEqual([
-      { id: created.selfId, displayName: "Ada" },
-      { id: joined.selfId, displayName: "Grace" },
+      { id: created.selfId, displayName: "Ada", connected: true },
+      { id: joined.selfId, displayName: "Grace", connected: true },
     ]);
     expect(update.snapshot).toEqual(joined.snapshot);
+    expect(update.snapshot).not.toHaveProperty("resumeToken");
+    expect(JSON.stringify(update)).not.toContain(joined.resumeToken);
   });
 
-  it("notifies remaining participants when someone disconnects", async () => {
-    const ada = await client();
-    ada.send({ type: "room.create", protocolVersion: ProtocolVersion, displayName: "Ada" });
-    const created = await ada.next();
-    if (created.type !== "room.joined") throw new Error("expected room.joined");
+  it("keeps a disconnected participant in the room, marked not connected", async () => {
+    const { host, viewer, roomId, hostId, viewerId } = await hostAndViewer();
 
-    const grace = await client();
-    grace.send({
-      type: "room.join",
-      protocolVersion: ProtocolVersion,
-      roomId: created.snapshot.roomId,
-      displayName: "Grace",
-    });
-    await grace.next();
-    await ada.next();
+    await viewer.close();
 
-    await grace.close();
-
-    expect(await ada.next()).toEqual({
+    expect(await host.next()).toEqual({
       type: "room.snapshot",
       snapshot: {
-        roomId: created.snapshot.roomId,
-        hostId: created.selfId,
-        participants: [{ id: created.selfId, displayName: "Ada" }],
+        roomId,
+        hostId,
+        participants: [
+          { id: hostId, displayName: "Ada", connected: true },
+          { id: viewerId, displayName: "Grace", connected: false },
+        ],
         media: null,
         playback: initialPlayback,
       },
     });
   });
 
-  it("promotes the remaining participant when the host disconnects", async () => {
+  it("keeps a disconnected host as host until the grace period ends, then transfers once", async () => {
     const { host, viewer, roomId, viewerId } = await hostAndViewer();
 
     await host.close();
+    expect(await viewer.next()).toMatchObject({
+      type: "room.snapshot",
+      snapshot: { hostId: expect.not.stringMatching(viewerId) },
+    });
+
+    serverClock.nowMs += GRACE_MS - 1;
+    fakeScheduler.runDue();
+    serverClock.nowMs += 1;
+    fakeScheduler.runDue();
 
     expect(await viewer.next()).toEqual({
       type: "room.snapshot",
       snapshot: {
         roomId,
         hostId: viewerId,
-        participants: [{ id: viewerId, displayName: "Grace" }],
+        participants: [{ id: viewerId, displayName: "Grace", connected: true }],
         media: null,
         playback: initialPlayback,
       },
     });
+    expect(fakeScheduler.pending()).toHaveLength(0);
   });
 
   it("broadcasts media set by the host to everyone, including the host", async () => {
@@ -499,6 +573,283 @@ describe("realtime rooms", () => {
 
     ada.send(clockPing(3));
     expect(await ada.next()).toMatchObject({ type: "clock.pong", id: 3 });
+  });
+
+  describe("session resume", () => {
+    it("restores the same participant within the grace period and tells the others", async () => {
+      const { host, viewer, roomId, hostId, viewerId, viewerToken } = await hostAndViewer();
+      await viewer.close();
+      await host.next();
+      serverClock.nowMs += 10_000;
+
+      const returning = await client();
+      returning.send(resumeMessage(roomId, viewerToken));
+
+      expect(await returning.next()).toEqual({
+        type: "room.resumed",
+        selfId: viewerId,
+        snapshot: {
+          roomId,
+          hostId,
+          participants: [
+            { id: hostId, displayName: "Ada", connected: true },
+            { id: viewerId, displayName: "Grace", connected: true },
+          ],
+          media: null,
+          playback: initialPlayback,
+        },
+      });
+      expect(await host.next()).toMatchObject({
+        type: "room.snapshot",
+        snapshot: { participants: [{ connected: true }, { connected: true }] },
+      });
+
+      // The old deadline no longer removes them.
+      serverClock.nowMs += GRACE_MS;
+      fakeScheduler.runDue();
+      host.send(mediaSet(media));
+      expect(await host.next()).toMatchObject({
+        type: "room.snapshot",
+        snapshot: { participants: [{ id: hostId }, { id: viewerId }], media },
+      });
+    });
+
+    it("lets a host resume and keep host authority", async () => {
+      const { host, viewer, roomId, hostId, hostToken } = await hostAndViewer();
+      await host.close();
+      await viewer.next();
+
+      const returning = await client();
+      returning.send(resumeMessage(roomId, hostToken));
+      expect(await returning.next()).toMatchObject({
+        type: "room.resumed",
+        selfId: hostId,
+        snapshot: { hostId },
+      });
+      await viewer.next();
+
+      returning.send(mediaSet(media));
+      expect(await returning.next()).toMatchObject({
+        type: "room.snapshot",
+        snapshot: { media },
+      });
+    });
+
+    it("gives a resuming viewer the current playback timeline", async () => {
+      const { host, viewer, roomId, viewerToken } = await roomWithMedia();
+      host.send(playbackSet("playing", 42));
+      await host.next();
+      await viewer.next();
+      await viewer.close();
+      await host.next();
+      serverClock.nowMs += 5000;
+
+      const returning = await client();
+      returning.send(resumeMessage(roomId, viewerToken));
+
+      expect(await returning.next()).toMatchObject({
+        type: "room.resumed",
+        snapshot: {
+          media,
+          playback: {
+            status: "playing",
+            positionSeconds: 42,
+            updatedAtServerMs: SERVER_NOW_MS,
+          },
+        },
+      });
+    });
+
+    it("rejects an unknown token without revealing it", async () => {
+      const { viewer, roomId, viewerToken } = await hostAndViewer();
+      await viewer.close();
+      const wrongToken = `${viewerToken.slice(0, -1)}${viewerToken.endsWith("A") ? "B" : "A"}`;
+
+      const intruder = await client();
+      intruder.send(resumeMessage(roomId, wrongToken));
+
+      const reply = await intruder.next();
+      expect(reply).toMatchObject({ type: "error", code: "resume_rejected" });
+      expect(JSON.stringify(reply)).not.toContain(wrongToken);
+    });
+
+    it("rejects a resume after the grace period has expired", async () => {
+      const { host, viewer, roomId, viewerToken } = await hostAndViewer();
+      await viewer.close();
+      await host.next();
+      serverClock.nowMs += GRACE_MS;
+      fakeScheduler.runDue();
+      await host.next();
+
+      const returning = await client();
+      returning.send(resumeMessage(roomId, viewerToken));
+
+      expect(await returning.next()).toMatchObject({ type: "error", code: "resume_rejected" });
+    });
+
+    it("resolves a resume at the deadline as expired even before the wake-up fires", async () => {
+      const { host, viewer, roomId, viewerToken } = await hostAndViewer();
+      await viewer.close();
+      await host.next();
+      serverClock.nowMs += GRACE_MS;
+
+      const returning = await client();
+      returning.send(resumeMessage(roomId, viewerToken));
+
+      expect(await returning.next()).toMatchObject({ type: "error", code: "resume_rejected" });
+      expect(await host.next()).toMatchObject({
+        type: "room.snapshot",
+        snapshot: { participants: [{ displayName: "Ada" }] },
+      });
+    });
+
+    it("hands the session to the newest connection and closes the old one", async () => {
+      const { host, viewer, roomId, viewerId, viewerToken } = await hostAndViewer();
+
+      const duplicate = await client();
+      duplicate.send(resumeMessage(roomId, viewerToken));
+
+      expect(await duplicate.next()).toMatchObject({ type: "room.resumed", selfId: viewerId });
+      expect(await viewer.next()).toMatchObject({ type: "error", code: "session_replaced" });
+      expect(await viewer.closed).toBe(SESSION_REPLACED_CLOSE_CODE);
+
+      // The old socket closing must not disconnect the participant: if it had,
+      // a "not connected" snapshot would reach the host before this one.
+      host.send(mediaSet(media));
+      expect(await host.next()).toMatchObject({
+        type: "room.snapshot",
+        snapshot: {
+          participants: [{ connected: true }, { id: viewerId, connected: true }],
+          media,
+        },
+      });
+      expect(await duplicate.next()).toMatchObject({ type: "room.snapshot", snapshot: { media } });
+      expect(fakeScheduler.pending()).toHaveLength(0);
+    });
+
+    it("rejects a resume on a connection that is already in a room", async () => {
+      const { host, roomId, viewerToken } = await hostAndViewer();
+
+      host.send(resumeMessage(roomId, viewerToken));
+
+      expect(await host.next()).toMatchObject({ type: "error", code: "already_in_room" });
+    });
+  });
+
+  describe("leave and expiry", () => {
+    it("removes a participant who leaves immediately and transfers host", async () => {
+      const { host, viewer, viewerId } = await hostAndViewer();
+
+      host.send({ type: "room.leave", protocolVersion: ProtocolVersion });
+
+      expect(await viewer.next()).toMatchObject({
+        type: "room.snapshot",
+        snapshot: {
+          hostId: viewerId,
+          participants: [{ id: viewerId, connected: true }],
+        },
+      });
+      // Closing the socket afterwards changes nothing.
+      await host.close();
+      expect(fakeScheduler.pending()).toHaveLength(0);
+    });
+
+    it("cannot resume after leaving", async () => {
+      const { host, viewer, roomId, hostToken } = await hostAndViewer();
+      host.send({ type: "room.leave", protocolVersion: ProtocolVersion });
+      await viewer.next();
+
+      const returning = await client();
+      returning.send(resumeMessage(roomId, hostToken));
+
+      expect(await returning.next()).toMatchObject({ type: "error", code: "resume_rejected" });
+    });
+
+    it("deletes the room after every participant has expired", async () => {
+      const { host, viewer, roomId } = await hostAndViewer();
+      await viewer.close();
+      await host.next();
+      await host.close();
+      // Nobody is left to receive a broadcast, so wait for the server to
+      // register the host's disconnect (its wake-up gets scheduled).
+      await waitFor(() => fakeScheduler.pending().length === 2);
+      serverClock.nowMs += GRACE_MS;
+      fakeScheduler.runDue();
+
+      const late = await client();
+      late.send({
+        type: "room.join",
+        protocolVersion: ProtocolVersion,
+        roomId,
+        displayName: "Linus",
+      });
+
+      expect(await late.next()).toMatchObject({ type: "error", code: "room_not_found" });
+    });
+  });
+
+  describe("heartbeat", () => {
+    const HEARTBEAT_MS = 15_000;
+
+    async function tick(): Promise<void> {
+      serverClock.nowMs += HEARTBEAT_MS;
+      fakeScheduler.runDue();
+      // Give pongs from responsive peers time to arrive before the next tick.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    it("terminates a connection that stops answering pings, starting its grace period", async () => {
+      await stopServer();
+      await startServer(HEARTBEAT_MS);
+
+      const host = await client();
+      host.send({ type: "room.create", protocolVersion: ProtocolVersion, displayName: "Ada" });
+      const created = await host.next();
+      if (created.type !== "room.joined") throw new Error("expected room.joined");
+
+      // A peer that never answers pings, like a half-open connection.
+      const silentSocket = new WebSocket(url, { autoPong: false });
+      await once(silentSocket, "open");
+      silentSocket.send(
+        JSON.stringify({
+          type: "room.join",
+          protocolVersion: ProtocolVersion,
+          roomId: created.snapshot.roomId,
+          displayName: "Grace",
+        }),
+      );
+      await host.next();
+
+      await tick();
+      await tick();
+
+      expect(await host.next()).toMatchObject({
+        type: "room.snapshot",
+        snapshot: {
+          participants: [
+            { displayName: "Ada", connected: true },
+            { displayName: "Grace", connected: false },
+          ],
+        },
+      });
+      silentSocket.terminate();
+    });
+
+    it("keeps connections that answer pings", async () => {
+      await stopServer();
+      await startServer(HEARTBEAT_MS);
+      const host = await client();
+      host.send({ type: "room.create", protocolVersion: ProtocolVersion, displayName: "Ada" });
+      await host.next();
+
+      await tick();
+      await tick();
+      await tick();
+
+      host.send(clockPing(7));
+      expect(await host.next()).toMatchObject({ type: "clock.pong", id: 7 });
+      expect(host.socket.readyState).toBe(WebSocket.OPEN);
+    });
   });
 
   it("rejects creating a second room on the same connection", async () => {

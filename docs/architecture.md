@@ -140,13 +140,32 @@ When a participant joins or reconnects, the server sends a complete room snapsho
 
 A snapshot simply means a complete description of the room at that moment.
 
-### Host role (interim)
+### Host role
 
 The participant who creates a room is its host. Only the host may change the shared media; the server checks this against the sender's server-side session, not against anything the client claims.
 
-Until reconnection grace periods are designed, host ownership transfers immediately: when the host disconnects, the earliest-joined remaining participant becomes host. The shared media is kept, which may leave it without a seeder (see Known Limitations).
+- A host whose connection drops stays host for the reconnect grace period (see below). A short interruption never transfers host.
+- When a host's grace period expires, host transfers to the earliest-joined participant who is currently connected, or, if nobody is connected, to the earliest-joined remaining participant.
+- A host who leaves deliberately (`room.leave`) hands over host immediately by the same rule.
+- The shared media is kept, which may leave it without a seeder (see Known Limitations).
 
 Host authority and media availability are separate. Transferring host status changes who may control the room; it cannot restore pieces of the file that no remaining participant has.
+
+### Reconnection and session resume
+
+A dropped WebSocket does not remove a participant right away. The server holds their place for a grace period, and the browser reconnects and proves it owns the session.
+
+- **Resume token.** On `room.create` or `room.join`, the server generates a secret resume token (32 random bytes, base64url) and sends it only to that participant in `room.joined`. The server keeps only a SHA-256 hash of it. Tokens never appear in snapshots, broadcasts, logs, or error messages. A participant ID is public and never authenticates anything.
+- **Browser storage.** The client stores `{ v, roomId, resumeToken }` in `sessionStorage` (per tab), so a refresh in the same tab can resume. It is validated on read and cleared on deliberate leave, when the server rejects the session, when another tab takes it over, or when reconnecting gives up. It is kept when the server reports a newer protocol version, so reloading the page resumes.
+- **Grace period: 30 s.** When a connection closes unexpectedly, the participant is marked `connected: false` in snapshots and keeps their seat (they still count toward the five-participant limit). If they resume in time, nothing else changes. Otherwise they are removed exactly once, with host transfer as described above. The room is deleted when nobody is left.
+- **Deadlines live in the room domain; wake-ups live in the realtime layer.** The room store records each disconnected participant's `expiresAtMs` from its injected clock and decides expiry itself (`expireDue()`); it never schedules timers. The realtime layer schedules a wake-up at the deadline, and a stale or duplicate wake-up is harmless. A resume is accepted only while `now < expiresAtMs`, and expired participants are processed before a resume is evaluated, so a resume racing its deadline resolves deterministically.
+- **Connections are versioned.** Each WebSocket gets a server-side connection ID, and every disconnect or leave names the connection it came from. Events from a connection that is no longer the participant's current one are ignored, so an old socket closing late can never disconnect or remove a participant whose new socket is active.
+- **Newest connection wins.** If a valid resume arrives while the participant still has a connection (a half-open socket, or a duplicated tab that copied `sessionStorage`), the new connection takes over. The old one receives `session_replaced`, is closed with code 4000, and does not reconnect.
+- **No token rotation in V1.** The token stays valid for the participant's lifetime. Rotation would make a leaked token single-use, but a resume response lost on a flaky connection would then lock the user out. The token only travels over the room's WebSocket and lives in one tab, where an attacker able to read it could act as the user directly anyway.
+- **Heartbeat.** The server pings every connection every 15 s and terminates one that has not answered the previous ping, which starts its grace period. This catches connections that disappear without a close (sleeping laptops, dropped Wi-Fi).
+- **Client reconnection.** After an unexpected close the client keeps showing the room ("Reconnecting…") and retries `room.resume` with capped exponential backoff: 500 ms doubling up to 5 s, with equal jitter (each delay is between half and all of that value). The browser's `online` event retries immediately. The client gives up after 60 s. Server rejections end the session with a message: an expired or unknown session (`resume_rejected`), a takeover by another tab (`session_replaced`), or a protocol mismatch (`unsupported_version`, which asks the user to reload).
+- **Resynchronizing.** A successful resume (`room.resumed`) delivers a fresh snapshot. The client starts a new clock-estimation session and re-applies the room's playback timeline even if its revision did not change. The torrent is not reloaded when the shared media is unchanged.
+- **Server restart.** Rooms live in memory, so after a restart every resume is rejected and clients return to the entry screen.
 
 ## Playback Synchronization Model
 
@@ -176,7 +195,7 @@ The server's `Date.now()` is the authoritative, transferable clock. Each client 
 - Browser JavaScript cannot use native WebSocket ping/pong frames, so clients send an application message `clock.ping { protocolVersion, id }`. The server replies immediately with `clock.pong { id, serverTimeMs }`, where `serverTimeMs` is its own clock. The server never trusts or echoes a client timestamp. Pings are allowed before and after joining a room.
 - For each sample, the client measures the round trip with `performance.now()`, assumes the server replied halfway through it, and stores the offset between its monotonic clock and server time: `offset = serverTimeMs - (sentAt + roundTrip / 2)`. Estimated server time is `performance.now() + offset`. Anchoring to the monotonic clock means client wall-clock changes (manual edits, resync after sleep) cannot corrupt the estimate.
 - A measurement round sends 5 pings, one at a time, with a 2 s timeout each. The sample with the lowest round trip wins, because it has the least room for asymmetric-delay error (at most half the round trip). Unknown, duplicate, and late pongs are ignored. A round without valid samples keeps the previous estimate.
-- Clients re-measure every 45 s and when the tab becomes visible again. Each WebSocket connection starts a fresh estimate. Clock failures are logged and never disconnect the room.
+- Clients re-measure every 45 s and when the tab becomes visible again. Each WebSocket connection starts a fresh estimate; after a reconnect, the previous connection's estimate is used until the new one has measured. Clock failures are logged and never disconnect the room.
 
 ### V1 position sync
 
@@ -255,6 +274,9 @@ Vitest is the test runner. Specific remaining library choices (for example WebTo
 - Playback is limited to formats and codecs supported by the participant's browser.
 - Shared media stays available only while participants who hold the needed pieces remain connected. If the original host leaves before others have downloaded the file, playback may stall.
 - Host transfer does not guarantee continued media availability.
+- A host who refreshes the page keeps host authority but stops seeding: the selected file cannot survive a reload. Until they pick it again, their own player streams the media from other participants, so only pieces someone already downloaded are available. The tab remembers which media it shared (`sessionStorage`), and a banner asks the host to choose the same file again. Picking the same file (same torrent info hash) resumes seeding without restarting playback; a file that does not match is only shared after the host confirms it as new media, which restarts playback.
+- Closing a tab is indistinguishable from a refresh, so it does not leave the room: the participant (and host role) is held for the 30 s grace period. Only the Leave button leaves immediately, and only while connected.
+- Disconnected participants keep their seat during the grace period, so a full room stays full until they return or expire.
 - There is no room-wide pause for buffering yet. A participant who is still downloading falls behind and is pulled forward by corrective seeks, which may cause repeated short stalls on slow connections.
 - Drift correction uses seeks only, so a correction is a visible jump rather than a gradual catch-up.
 - Peer discovery depends on available WebTorrent-compatible trackers.
@@ -275,7 +297,7 @@ The following decisions will be made during implementation and testing:
 
 - Final synchronization drift thresholds. The current starting values (0.25 s when applying room state, 0.5 s drift with a 3 s cooldown) should be tuned through testing.
 - Whether minor drift should use temporary playback-rate adjustment instead of seeking (V1 currently seeks only).
-- Reconnection and host grace-period durations.
+- Final reconnection timings. The starting values (30 s grace, 15 s heartbeat, 500 ms to 5 s backoff, 60 s client give-up) should be tuned through testing.
 - Room expiration duration.
 - Shared subtitle distribution method.
 - WebTorrent tracker selection and fallback behavior.

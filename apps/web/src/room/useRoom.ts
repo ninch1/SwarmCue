@@ -1,27 +1,11 @@
-import {
-  ClientMessageSchema,
-  ProtocolVersion,
-  type ClientMessage,
-  type ParticipantId,
-  type PlaybackStatus,
-  type RoomSnapshot,
-  type SharedMedia,
-} from "@swarmcue/protocol";
+import type { PlaybackStatus, SharedMedia } from "@swarmcue/protocol";
 import { useEffect, useRef, useState } from "react";
-import { startClockSync, type ClockSync } from "../clock/clockSync.js";
-import { openRoomConnection, type RoomConnection } from "./connection.js";
-import { normalizeRoomCode } from "./roomCode.js";
+import { startClockSync } from "../clock/clockSync.js";
+import { openRoomConnection } from "./connection.js";
+import { createRoomSession, type RoomSession, type RoomState } from "./roomSession.js";
+import { browserSessionStorage, createSessionStore } from "./sessionStore.js";
 
-export type RoomState =
-  | { status: "idle"; error: string | null }
-  | { status: "connecting" }
-  | {
-      status: "in-room";
-      selfId: ParticipantId;
-      snapshot: RoomSnapshot;
-      /** Latest server error while in the room; cleared by the next snapshot. */
-      error: string | null;
-    };
+export type { RoomState } from "./roomSession.js";
 
 export type UseRoom = {
   state: RoomState;
@@ -40,202 +24,71 @@ export type UseRoom = {
    */
   setPlayback: (status: PlaybackStatus, positionSeconds: number) => string | null;
   /**
-   * Estimated current server time in epoch ms, or null before the current
-   * connection has measured the clock. Local-only; never sent as room state.
+   * Estimated current server time in epoch ms, or null before the clock has
+   * been measured. Local-only; never sent as room state.
    */
   estimateServerNowMs: () => number | null;
 };
 
-/** Returns the validated message, or the first validation message as a string. */
-function validateClientMessage(
-  rawMessage: unknown,
-  fallback: string,
-): ClientMessage | string {
-  const parsed = ClientMessageSchema.safeParse(rawMessage);
-  if (!parsed.success) {
-    return parsed.error.issues[0]?.message ?? fallback;
-  }
-  return parsed.data;
-}
+const NOT_READY = "The room connection is not ready yet.";
 
 /**
- * One WebSocket per room session: opened on create/join, closed on leave.
- * There is no reconnection yet, so a dropped connection returns to idle.
+ * React adapter for the room session controller. On mount it resumes the
+ * session stored for this tab (e.g. after a refresh); on unmount it stops
+ * without forgetting that session.
  */
 export function useRoom(): UseRoom {
   const [state, setState] = useState<RoomState>({ status: "idle", error: null });
-  const connectionRef = useRef<RoomConnection | null>(null);
-  /** The connection that has completed create/join; null while connecting or idle. */
-  const joinedConnectionRef = useRef<RoomConnection | null>(null);
-  /** Clock estimation for the current connection; a new connection starts fresh. */
-  const clockRef = useRef<ClockSync | null>(null);
-
-  function disposeClock(): void {
-    clockRef.current?.dispose();
-    clockRef.current = null;
-  }
+  const sessionRef = useRef<RoomSession | null>(null);
 
   useEffect(() => {
-    return () => {
-      disposeClock();
-      const connection = connectionRef.current;
-      connectionRef.current = null;
-      connection?.close();
-    };
-  }, []);
+    const session = createRoomSession({
+      openConnection: openRoomConnection,
+      startClockSync,
+      sessionStore: createSessionStore(browserSessionStorage()),
+      onStateChange: setState,
+      setTimer: (callback, delayMs) => window.setTimeout(callback, delayMs),
+      clearTimer: (handle) => window.clearTimeout(handle as number),
+      random: Math.random,
+      monotonicNow: () => performance.now(),
+    });
+    sessionRef.current = session;
+    session.resumeStored();
 
-  // Timers may be throttled or the clock paused while hidden; re-measure on return.
-  useEffect(() => {
+    // Timers may be throttled or the clock paused while hidden; re-measure on return.
     function handleVisibilityChange() {
       if (document.visibilityState === "visible") {
-        clockRef.current?.resyncNow();
+        session.resyncClock();
       }
     }
+    function handleOnline() {
+      session.reconnectNow();
+    }
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("online", handleOnline);
+
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("online", handleOnline);
+      session.dispose();
+      if (sessionRef.current === session) {
+        sessionRef.current = null;
+      }
     };
   }, []);
-
-  function closeCurrent(): void {
-    disposeClock();
-    const connection = connectionRef.current;
-    connectionRef.current = null;
-    joinedConnectionRef.current = null;
-    connection?.close();
-  }
-
-  function start(rawMessage: unknown): void {
-    // Validate locally first so the user gets immediate, specific feedback.
-    const firstMessage = validateClientMessage(rawMessage, "Invalid room details.");
-    if (typeof firstMessage === "string") {
-      setState({ status: "idle", error: firstMessage });
-      return;
-    }
-
-    closeCurrent();
-    setState({ status: "connecting" });
-
-    let joined = false;
-    const connection = openRoomConnection({
-      onOpen: () => {
-        connection.send(firstMessage);
-        if (connectionRef.current !== connection) {
-          return;
-        }
-        disposeClock();
-        clockRef.current = startClockSync({
-          sendPing: (id) => {
-            connection.send({ type: "clock.ping", protocolVersion: ProtocolVersion, id });
-          },
-        });
-      },
-      onMessage: (message) => {
-        if (connectionRef.current !== connection) {
-          return;
-        }
-        switch (message.type) {
-          case "clock.pong":
-            clockRef.current?.handlePong(message);
-            return;
-          case "room.joined":
-            joined = true;
-            joinedConnectionRef.current = connection;
-            setState({
-              status: "in-room",
-              selfId: message.selfId,
-              snapshot: message.snapshot,
-              error: null,
-            });
-            return;
-          case "room.snapshot":
-            setState((previous) =>
-              previous.status === "in-room"
-                ? { ...previous, snapshot: message.snapshot, error: null }
-                : previous,
-            );
-            return;
-          case "error":
-            if (joined) {
-              setState((previous) =>
-                previous.status === "in-room"
-                  ? { ...previous, error: message.message }
-                  : previous,
-              );
-              return;
-            }
-            closeCurrent();
-            setState({ status: "idle", error: message.message });
-            return;
-        }
-      },
-      onClose: () => {
-        // Ignore sockets we already replaced or closed on purpose.
-        if (connectionRef.current !== connection) {
-          return;
-        }
-        disposeClock();
-        connectionRef.current = null;
-        joinedConnectionRef.current = null;
-        setState({
-          status: "idle",
-          error: joined
-            ? "Disconnected from the room server."
-            : "Could not connect to the room server.",
-        });
-      },
-    });
-    connectionRef.current = connection;
-  }
 
   return {
     state,
-    createRoom: (displayName) => {
-      start({ type: "room.create", protocolVersion: ProtocolVersion, displayName });
-    },
-    joinRoom: (roomCode, displayName) => {
-      start({
-        type: "room.join",
-        protocolVersion: ProtocolVersion,
-        roomId: normalizeRoomCode(roomCode),
-        displayName,
-      });
-    },
-    leaveRoom: () => {
-      closeCurrent();
-      setState({ status: "idle", error: null });
-    },
-    setMedia: (media) => {
-      // A ref, not `state`: callers may invoke this after an async step.
-      const connection = joinedConnectionRef.current;
-      if (!connection) {
-        return "Join a room before sharing media.";
-      }
-      const message = validateClientMessage(
-        { type: "media.set", protocolVersion: ProtocolVersion, media },
-        "This media cannot be shared.",
-      );
-      if (typeof message === "string") {
-        return message;
-      }
-      connection.send(message);
-      return null;
-    },
-    setPlayback: (status, positionSeconds) => {
-      const connection = joinedConnectionRef.current;
-      if (!connection) {
-        return "Join a room before controlling playback.";
-      }
-      const message = validateClientMessage(
-        { type: "playback.set", protocolVersion: ProtocolVersion, status, positionSeconds },
-        "Invalid playback command.",
-      );
-      if (typeof message === "string") {
-        return message;
-      }
-      connection.send(message);
-      return null;
-    },
-    estimateServerNowMs: () => clockRef.current?.estimateServerNowMs() ?? null,
+    createRoom: (displayName) => sessionRef.current?.createRoom(displayName),
+    joinRoom: (roomCode, displayName) => sessionRef.current?.joinRoom(roomCode, displayName),
+    leaveRoom: () => sessionRef.current?.leave(),
+    // A null result means the command was sent; only a missing session is "not ready".
+    setMedia: (media) =>
+      sessionRef.current ? sessionRef.current.setMedia(media) : NOT_READY,
+    setPlayback: (status, positionSeconds) =>
+      sessionRef.current
+        ? sessionRef.current.setPlayback(status, positionSeconds)
+        : NOT_READY,
+    estimateServerNowMs: () => sessionRef.current?.estimateServerNowMs() ?? null,
   };
 }

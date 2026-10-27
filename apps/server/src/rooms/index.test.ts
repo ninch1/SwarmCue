@@ -1,9 +1,10 @@
-import { RoomIdSchema } from "@swarmcue/protocol";
+import { ResumeTokenSchema, RoomIdSchema } from "@swarmcue/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
-import { generateRoomId } from "./ids.js";
+import { generateResumeToken, generateRoomId, hashResumeToken } from "./ids.js";
 import { createRoomStore } from "./index.js";
 
 const START_MS = 1_700_000_000_000;
+const GRACE_MS = 30_000;
 /** Server clock shared by every test store; reset before each test. */
 const clock = { nowMs: START_MS };
 
@@ -11,12 +12,17 @@ beforeEach(() => {
   clock.nowMs = START_MS;
 });
 
+/**
+ * Participants are p1, p2, … with resume tokens tok1, tok2, …. Tests use
+ * connection id N for participant pN's first connection.
+ */
 function createTestStore(options: {
   roomIds?: string[];
   maxParticipants?: number;
 } = {}) {
   const roomIds = [...(options.roomIds ?? ["AAAAAAAA", "BBBBBBBB", "CCCCCCCC"])];
   let participantCount = 0;
+  let tokenCount = 0;
 
   return createRoomStore({
     generateRoomId: () => {
@@ -30,9 +36,24 @@ function createTestStore(options: {
       participantCount += 1;
       return `p${participantCount}`;
     },
+    generateResumeToken: () => {
+      tokenCount += 1;
+      return `tok${tokenCount}`;
+    },
+    hashResumeToken: (token) => `hash:${token}`,
     maxParticipants: options.maxParticipants ?? 5,
+    graceMs: GRACE_MS,
     now: () => clock.nowMs,
   });
+}
+
+/** Ada (p1, host, connection 1), Grace (p2, connection 2), Linus (p3, connection 3). */
+function roomOfThree() {
+  const store = createTestStore();
+  const { snapshot } = store.createRoom("Ada", 1);
+  store.joinRoom(snapshot.roomId, "Grace", 2);
+  store.joinRoom(snapshot.roomId, "Linus", 3);
+  return { store, roomId: snapshot.roomId };
 }
 
 const initialPlayback = {
@@ -48,17 +69,21 @@ const media = {
   sizeBytes: 1024,
 };
 
+const ada = { id: "p1", displayName: "Ada", connected: true };
+const grace = { id: "p2", displayName: "Grace", connected: true };
+
 describe("createRoomStore", () => {
   it("creates a room containing only the creator, who is host", () => {
     const store = createTestStore();
 
-    const { participant, snapshot } = store.createRoom("Ada");
+    const { participant, resumeToken, snapshot } = store.createRoom("Ada", 1);
 
-    expect(participant).toEqual({ id: "p1", displayName: "Ada" });
+    expect(participant).toEqual(ada);
+    expect(resumeToken).toBe("tok1");
     expect(snapshot).toEqual({
       roomId: "AAAAAAAA",
       hostId: "p1",
-      participants: [{ id: "p1", displayName: "Ada" }],
+      participants: [ada],
       media: null,
       playback: initialPlayback,
     });
@@ -66,118 +91,329 @@ describe("createRoomStore", () => {
 
   it("gives joiners the same snapshot in join order without making them host", () => {
     const store = createTestStore();
-    const created = store.createRoom("Ada");
+    const created = store.createRoom("Ada", 1);
 
-    const joined = store.joinRoom(created.snapshot.roomId, "Grace");
+    const joined = store.joinRoom(created.snapshot.roomId, "Grace", 2);
 
     expect(joined).toEqual({
       ok: true,
-      participant: { id: "p2", displayName: "Grace" },
+      participant: grace,
+      resumeToken: "tok2",
       snapshot: {
         roomId: "AAAAAAAA",
         hostId: "p1",
-        participants: [
-          { id: "p1", displayName: "Ada" },
-          { id: "p2", displayName: "Grace" },
-        ],
+        participants: [ada, grace],
         media: null,
         playback: initialPlayback,
       },
     });
-    expect(store.getSnapshot("AAAAAAAA")).toEqual(
-      joined.ok ? joined.snapshot : null,
-    );
+    expect(store.getSnapshot("AAAAAAAA")).toEqual(joined.ok ? joined.snapshot : null);
   });
 
   it("rejects joining an unknown room", () => {
     const store = createTestStore();
 
-    expect(store.joinRoom("ZZZZZZZZ", "Grace")).toEqual({
+    expect(store.joinRoom("ZZZZZZZZ", "Grace", 2)).toEqual({
       ok: false,
       error: "room_not_found",
     });
   });
 
-  it("rejects joining a full room", () => {
+  it("rejects joining a full room, counting disconnected participants", () => {
     const store = createTestStore({ maxParticipants: 2 });
-    const { snapshot } = store.createRoom("Ada");
-    store.joinRoom(snapshot.roomId, "Grace");
+    const { snapshot } = store.createRoom("Ada", 1);
+    store.joinRoom(snapshot.roomId, "Grace", 2);
+    store.markDisconnected(snapshot.roomId, "p2", 2);
 
-    expect(store.joinRoom(snapshot.roomId, "Linus")).toEqual({
+    expect(store.joinRoom(snapshot.roomId, "Linus", 3)).toEqual({
       ok: false,
       error: "room_full",
     });
     expect(store.getSnapshot(snapshot.roomId)?.participants).toHaveLength(2);
   });
 
-  it("keeps the host when a non-host participant leaves", () => {
-    const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
-    store.joinRoom(snapshot.roomId, "Grace");
-
-    expect(store.leaveRoom(snapshot.roomId, "p2")).toEqual({
-      roomId: "AAAAAAAA",
-      hostId: "p1",
-      participants: [{ id: "p1", displayName: "Ada" }],
-      media: null,
-      playback: initialPlayback,
-    });
-  });
-
-  it("promotes the earliest-joined remaining participant when the host leaves", () => {
-    const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
-    store.joinRoom(snapshot.roomId, "Grace");
-    store.joinRoom(snapshot.roomId, "Linus");
-
-    expect(store.leaveRoom(snapshot.roomId, "p1")).toEqual({
-      roomId: "AAAAAAAA",
-      hostId: "p2",
-      participants: [
-        { id: "p2", displayName: "Grace" },
-        { id: "p3", displayName: "Linus" },
-      ],
-      media: null,
-      playback: initialPlayback,
-    });
-  });
-
-  it("deletes the room when the last participant leaves", () => {
-    const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
-
-    expect(store.leaveRoom(snapshot.roomId, "p1")).toBeNull();
-    expect(store.getSnapshot(snapshot.roomId)).toBeNull();
-    expect(store.joinRoom(snapshot.roomId, "Grace")).toEqual({
-      ok: false,
-      error: "room_not_found",
-    });
-  });
-
   it("skips generated room ids that are already in use", () => {
     const store = createTestStore({ roomIds: ["AAAAAAAA", "AAAAAAAA", "BBBBBBBB"] });
 
-    store.createRoom("Ada");
-    const second = store.createRoom("Grace");
+    store.createRoom("Ada", 1);
+    const second = store.createRoom("Grace", 2);
 
     expect(second.snapshot.roomId).toBe("BBBBBBBB");
   });
 
   it("does not expose internal state through returned snapshots", () => {
     const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
+    const { snapshot } = store.createRoom("Ada", 1);
 
-    snapshot.participants.push({ id: "intruder", displayName: "Eve" });
+    snapshot.participants.push({ id: "intruder", displayName: "Eve", connected: true });
 
     expect(store.getSnapshot(snapshot.roomId)?.participants).toHaveLength(1);
+  });
+
+  it("never puts resume tokens or their hashes in snapshots", () => {
+    const { store, roomId } = roomOfThree();
+    store.markDisconnected(roomId, "p2", 2);
+
+    const serialized = JSON.stringify(store.getSnapshot(roomId));
+
+    expect(serialized).not.toMatch(/tok\d/);
+    expect(serialized).not.toContain("hash:");
+  });
+});
+
+describe("leave", () => {
+  it("removes a non-host immediately and keeps the host", () => {
+    const { store, roomId } = roomOfThree();
+
+    const result = store.leave(roomId, "p2", 2);
+
+    expect(result.ok && result.snapshot).toMatchObject({
+      hostId: "p1",
+      participants: [{ id: "p1" }, { id: "p3" }],
+    });
+  });
+
+  it("transfers host immediately to the earliest-joined connected participant", () => {
+    const { store, roomId } = roomOfThree();
+    store.markDisconnected(roomId, "p2", 2);
+
+    const result = store.leave(roomId, "p1", 1);
+
+    expect(result.ok && result.snapshot?.hostId).toBe("p3");
+  });
+
+  it("deletes the room when the last participant leaves", () => {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada", 1);
+
+    expect(store.leave(snapshot.roomId, "p1", 1)).toEqual({ ok: true, snapshot: null });
+    expect(store.getSnapshot(snapshot.roomId)).toBeNull();
+    expect(store.joinRoom(snapshot.roomId, "Grace", 2)).toEqual({
+      ok: false,
+      error: "room_not_found",
+    });
+  });
+
+  it("ignores a leave from a connection that is not the participant's current one", () => {
+    const { store, roomId } = roomOfThree();
+    store.resume(roomId, "tok2", 20);
+
+    expect(store.leave(roomId, "p2", 2)).toEqual({ ok: false });
+    expect(store.getSnapshot(roomId)?.participants).toHaveLength(3);
+  });
+});
+
+describe("disconnect and grace period", () => {
+  it("keeps a disconnected participant in the room, marked not connected", () => {
+    const { store, roomId } = roomOfThree();
+
+    const result = store.markDisconnected(roomId, "p2", 2);
+
+    expect(result).toMatchObject({
+      changed: true,
+      expiresAtMs: START_MS + GRACE_MS,
+      snapshot: {
+        participants: [
+          { id: "p1", connected: true },
+          { id: "p2", connected: false },
+          { id: "p3", connected: true },
+        ],
+      },
+    });
+  });
+
+  it("reports repeated disconnects only once, so no duplicate removal is scheduled", () => {
+    const { store, roomId } = roomOfThree();
+    store.markDisconnected(roomId, "p2", 2);
+    clock.nowMs += 5000;
+
+    expect(store.markDisconnected(roomId, "p2", 2)).toEqual({ changed: false });
+  });
+
+  it("does not transfer host while the host is within the grace period", () => {
+    const { store, roomId } = roomOfThree();
+    store.markDisconnected(roomId, "p1", 1);
+    clock.nowMs += GRACE_MS - 1;
+
+    expect(store.expireDue()).toEqual([]);
+    expect(store.getSnapshot(roomId)?.hostId).toBe("p1");
+  });
+
+  it("removes a non-host once the grace period ends", () => {
+    const { store, roomId } = roomOfThree();
+    store.markDisconnected(roomId, "p2", 2);
+    clock.nowMs += GRACE_MS;
+
+    expect(store.expireDue()).toEqual([
+      {
+        roomId,
+        snapshot: expect.objectContaining({
+          hostId: "p1",
+          participants: [
+            expect.objectContaining({ id: "p1" }),
+            expect.objectContaining({ id: "p3" }),
+          ],
+        }),
+      },
+    ]);
+  });
+
+  it("transfers host exactly once after the host's grace period, to the earliest connected participant", () => {
+    const { store, roomId } = roomOfThree();
+    // Grace (earlier-joined) is also away, so Linus is the earliest connected one.
+    store.markDisconnected(roomId, "p2", 2);
+    clock.nowMs += 1000;
+    store.markDisconnected(roomId, "p1", 1);
+    clock.nowMs += GRACE_MS - 1000;
+
+    // Grace's deadline has passed; Ada's is 1 s away.
+    const first = store.expireDue();
+    expect(first).toHaveLength(1);
+    expect(first[0]?.snapshot?.hostId).toBe("p1");
+
+    clock.nowMs += 1000;
+    const second = store.expireDue();
+    expect(second[0]?.snapshot).toMatchObject({
+      hostId: "p3",
+      participants: [{ id: "p3", connected: true }],
+    });
+
+    // A late or duplicate wake-up changes nothing.
+    expect(store.expireDue()).toEqual([]);
+  });
+
+  it("falls back to the earliest-joined remaining participant when nobody is connected", () => {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada", 1);
+    store.joinRoom(snapshot.roomId, "Grace", 2);
+    store.markDisconnected(snapshot.roomId, "p1", 1);
+    clock.nowMs += 1000;
+    store.markDisconnected(snapshot.roomId, "p2", 2);
+    clock.nowMs += GRACE_MS - 1000;
+
+    const [expired] = store.expireDue();
+
+    expect(expired?.snapshot).toMatchObject({
+      hostId: "p2",
+      participants: [{ id: "p2", connected: false }],
+    });
+  });
+
+  it("deletes the room after every participant expires", () => {
+    const store = createTestStore();
+    const { snapshot } = store.createRoom("Ada", 1);
+    store.joinRoom(snapshot.roomId, "Grace", 2);
+    store.markDisconnected(snapshot.roomId, "p1", 1);
+    store.markDisconnected(snapshot.roomId, "p2", 2);
+    clock.nowMs += GRACE_MS;
+
+    expect(store.expireDue()).toEqual([{ roomId: snapshot.roomId, snapshot: null }]);
+    expect(store.getSnapshot(snapshot.roomId)).toBeNull();
+  });
+
+  it("ignores a disconnect from a connection the participant no longer uses", () => {
+    const { store, roomId } = roomOfThree();
+    store.resume(roomId, "tok2", 20);
+
+    // The replaced socket closes after the new one took over.
+    expect(store.markDisconnected(roomId, "p2", 2)).toEqual({ changed: false });
+    expect(store.getSnapshot(roomId)?.participants[1]).toEqual(grace);
+  });
+});
+
+describe("resume", () => {
+  it("restores the same participant and host role within the grace period", () => {
+    const { store, roomId } = roomOfThree();
+    store.markDisconnected(roomId, "p1", 1);
+    clock.nowMs += 10_000;
+
+    const result = store.resume(roomId, "tok1", 10);
+
+    expect(result).toMatchObject({
+      ok: true,
+      participantId: "p1",
+      replacedConnectionId: null,
+      changed: true,
+      snapshot: { hostId: "p1" },
+    });
+    const participants = store.getSnapshot(roomId)?.participants ?? [];
+    expect(participants).toHaveLength(3);
+    expect(participants.filter((p) => p.id === "p1")).toEqual([ada]);
+    // The old deadline no longer applies.
+    clock.nowMs += GRACE_MS;
+    expect(store.expireDue()).toEqual([]);
+  });
+
+  it("succeeds one millisecond before the deadline, and the later wake-up does nothing", () => {
+    const { store, roomId } = roomOfThree();
+    store.markDisconnected(roomId, "p2", 2);
+    clock.nowMs = START_MS + GRACE_MS - 1;
+
+    expect(store.resume(roomId, "tok2", 20).ok).toBe(true);
+
+    clock.nowMs = START_MS + GRACE_MS;
+    expect(store.expireDue()).toEqual([]);
+    expect(store.getSnapshot(roomId)?.participants).toHaveLength(3);
+  });
+
+  it("is rejected at the deadline, before the wake-up has removed the participant", () => {
+    const { store, roomId } = roomOfThree();
+    store.markDisconnected(roomId, "p2", 2);
+    clock.nowMs = START_MS + GRACE_MS;
+
+    expect(store.resume(roomId, "tok2", 20)).toEqual({
+      ok: false,
+      error: "resume_rejected",
+    });
+    expect(store.expireDue()).toHaveLength(1);
+  });
+
+  it("is rejected after the participant has expired", () => {
+    const { store, roomId } = roomOfThree();
+    store.markDisconnected(roomId, "p2", 2);
+    clock.nowMs += GRACE_MS;
+    store.expireDue();
+
+    expect(store.resume(roomId, "tok2", 20)).toEqual({
+      ok: false,
+      error: "resume_rejected",
+    });
+  });
+
+  it.each([
+    ["wrong token", "AAAAAAAA", "tok9"],
+    ["another room's code", "ZZZZZZZZ", "tok2"],
+    ["participant id instead of token", "AAAAAAAA", "p2"],
+  ])("rejects a %s", (_label, roomId, token) => {
+    const { store } = roomOfThree();
+    store.markDisconnected("AAAAAAAA", "p2", 2);
+
+    expect(store.resume(roomId, token, 20)).toEqual({
+      ok: false,
+      error: "resume_rejected",
+    });
+  });
+
+  it("lets a newer connection take over a still-connected session", () => {
+    const { store, roomId } = roomOfThree();
+
+    expect(store.resume(roomId, "tok2", 20)).toMatchObject({
+      ok: true,
+      participantId: "p2",
+      replacedConnectionId: 2,
+      changed: false,
+    });
+    // The newest connection wins again if a third one resumes.
+    expect(store.resume(roomId, "tok2", 21)).toMatchObject({ replacedConnectionId: 20 });
+    expect(store.getSnapshot(roomId)?.participants).toHaveLength(3);
   });
 });
 
 describe("setMedia", () => {
   it("lets the host set media and returns the updated snapshot", () => {
     const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
-    store.joinRoom(snapshot.roomId, "Grace");
+    const { snapshot } = store.createRoom("Ada", 1);
+    store.joinRoom(snapshot.roomId, "Grace", 2);
 
     const result = store.setMedia(snapshot.roomId, "p1", media);
 
@@ -186,10 +422,7 @@ describe("setMedia", () => {
       snapshot: {
         roomId: "AAAAAAAA",
         hostId: "p1",
-        participants: [
-          { id: "p1", displayName: "Ada" },
-          { id: "p2", displayName: "Grace" },
-        ],
+        participants: [ada, grace],
         media,
         playback: { ...initialPlayback, revision: 1 },
       },
@@ -199,8 +432,8 @@ describe("setMedia", () => {
 
   it("rejects a non-host and leaves the state unchanged", () => {
     const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
-    store.joinRoom(snapshot.roomId, "Grace");
+    const { snapshot } = store.createRoom("Ada", 1);
+    store.joinRoom(snapshot.roomId, "Grace", 2);
 
     expect(store.setMedia(snapshot.roomId, "p2", media)).toEqual({
       ok: false,
@@ -220,12 +453,12 @@ describe("setMedia", () => {
 
   it("keeps the media when the host leaves and lets the new host replace it", () => {
     const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
-    store.joinRoom(snapshot.roomId, "Grace");
+    const { snapshot } = store.createRoom("Ada", 1);
+    store.joinRoom(snapshot.roomId, "Grace", 2);
     store.setMedia(snapshot.roomId, "p1", media);
 
-    const afterLeave = store.leaveRoom(snapshot.roomId, "p1");
-    expect(afterLeave?.media).toEqual(media);
+    const afterLeave = store.leave(snapshot.roomId, "p1", 1);
+    expect(afterLeave.ok && afterLeave.snapshot?.media).toEqual(media);
 
     const replacement = { ...media, name: "other.mp4" };
     expect(store.setMedia(snapshot.roomId, "p2", replacement).ok).toBe(true);
@@ -234,7 +467,7 @@ describe("setMedia", () => {
 
   it("does not expose stored media through snapshots or the caller's object", () => {
     const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
+    const { snapshot } = store.createRoom("Ada", 1);
     const input = { ...media };
 
     const result = store.setMedia(snapshot.roomId, "p1", input);
@@ -250,8 +483,8 @@ describe("setMedia", () => {
 describe("setPlayback", () => {
   function roomWithMedia() {
     const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
-    store.joinRoom(snapshot.roomId, "Grace");
+    const { snapshot } = store.createRoom("Ada", 1);
+    store.joinRoom(snapshot.roomId, "Grace", 2);
     store.setMedia(snapshot.roomId, "p1", media);
     return { store, roomId: snapshot.roomId };
   }
@@ -335,7 +568,7 @@ describe("setPlayback", () => {
 
   it("rejects playback before any media is shared", () => {
     const store = createTestStore();
-    const { snapshot } = store.createRoom("Ada");
+    const { snapshot } = store.createRoom("Ada", 1);
 
     expect(store.setPlayback(snapshot.roomId, "p1", play(0))).toEqual({
       ok: false,
@@ -372,23 +605,47 @@ describe("setPlayback", () => {
     });
   });
 
-  it("keeps the playback state when the host leaves", () => {
+  it("keeps the playback timeline through a disconnect, resume, and host transfer", () => {
     const { store, roomId } = roomWithMedia();
     store.setPlayback(roomId, "p1", play(12));
+    const timeline = store.getSnapshot(roomId)?.playback;
 
-    expect(store.leaveRoom(roomId, "p1")?.playback).toEqual({
-      status: "playing",
-      positionSeconds: 12,
-      updatedAtServerMs: START_MS,
-      revision: 2,
+    store.markDisconnected(roomId, "p1", 1);
+    clock.nowMs += 5000;
+    expect(store.resume(roomId, "tok1", 10)).toMatchObject({
+      ok: true,
+      snapshot: { playback: timeline },
+    });
+
+    expect(store.leave(roomId, "p1", 10)).toMatchObject({
+      ok: true,
+      snapshot: { hostId: "p2", playback: timeline },
     });
   });
 });
 
-describe("generateRoomId", () => {
-  it("produces codes that match the protocol format", () => {
+describe("ids", () => {
+  it("generates room codes that match the protocol format", () => {
     for (let index = 0; index < 100; index += 1) {
       expect(RoomIdSchema.safeParse(generateRoomId()).success).toBe(true);
     }
+  });
+
+  it("generates unique resume tokens that match the protocol format", () => {
+    const tokens = new Set<string>();
+    for (let index = 0; index < 100; index += 1) {
+      const token = generateResumeToken();
+      expect(ResumeTokenSchema.safeParse(token).success).toBe(true);
+      tokens.add(token);
+    }
+    expect(tokens.size).toBe(100);
+  });
+
+  it("hashes tokens deterministically without revealing them", () => {
+    const token = generateResumeToken();
+
+    expect(hashResumeToken(token)).toBe(hashResumeToken(token));
+    expect(hashResumeToken(token)).not.toContain(token);
+    expect(hashResumeToken(token)).not.toBe(hashResumeToken(generateResumeToken()));
   });
 });

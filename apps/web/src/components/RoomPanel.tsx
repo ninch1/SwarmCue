@@ -1,5 +1,6 @@
 import type { Participant, SharedMedia } from "@swarmcue/protocol";
 import { useId, useState, type FormEvent } from "react";
+import { formatBytes } from "../media/formatBytes.js";
 import { formatRoomCode } from "../room/roomCode.js";
 import type { UseRoom } from "../room/useRoom.js";
 
@@ -25,15 +26,23 @@ export function RoomPanel({ room }: RoomPanelProps) {
         hostId={state.snapshot.hostId}
         participants={state.snapshot.participants}
         media={state.snapshot.media}
+        reconnecting={state.connection === "reconnecting"}
         error={state.error}
         onLeave={room.leaveRoom}
       />
     );
   }
 
+  let progress: string | null = null;
+  if (state.status === "connecting") {
+    progress = "Connecting…";
+  } else if (state.status === "resuming") {
+    progress = "Rejoining your room…";
+  }
+
   return (
     <RoomEntry
-      connecting={state.status === "connecting"}
+      progress={progress}
       error={state.status === "idle" ? state.error : null}
       onCreate={room.createRoom}
       onJoin={room.joinRoom}
@@ -42,13 +51,15 @@ export function RoomPanel({ room }: RoomPanelProps) {
 }
 
 type RoomEntryProps = {
-  connecting: boolean;
+  /** Shown while connecting or rejoining; the form is disabled meanwhile. */
+  progress: string | null;
   error: string | null;
   onCreate: (displayName: string) => void;
   onJoin: (roomCode: string, displayName: string) => void;
 };
 
-function RoomEntry({ connecting, error, onCreate, onJoin }: RoomEntryProps) {
+function RoomEntry({ progress, error, onCreate, onJoin }: RoomEntryProps) {
+  const connecting = progress !== null;
   const id = useId();
   const [displayName, setDisplayName] = useState("");
   const [roomCode, setRoomCode] = useState("");
@@ -115,9 +126,9 @@ function RoomEntry({ connecting, error, onCreate, onJoin }: RoomEntryProps) {
         </form>
       </div>
 
-      {connecting ? (
+      {progress ? (
         <p className="m-0 text-sm text-accent" role="status">
-          Connecting…
+          {progress}
         </p>
       ) : null}
       {error ? (
@@ -135,20 +146,11 @@ type InRoomProps = {
   hostId: string;
   participants: Participant[];
   media: SharedMedia | null;
+  /** This client lost its connection and is trying to resume. */
+  reconnecting: boolean;
   error: string | null;
   onLeave: () => void;
 };
-
-function formatBytes(bytes: number): string {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return unit === 0 ? `${value} B` : `${value.toFixed(1)} ${units[unit]}`;
-}
 
 function InRoom({
   roomId,
@@ -156,6 +158,7 @@ function InRoom({
   hostId,
   participants,
   media,
+  reconnecting,
   error,
   onLeave,
 }: InRoomProps) {
@@ -205,6 +208,12 @@ function InRoom({
         </button>
       </div>
 
+      {reconnecting ? (
+        <p className="m-0 text-sm text-accent" role="status">
+          Connection lost. Reconnecting…
+        </p>
+      ) : null}
+
       <p className="m-0 text-sm text-muted">
         {participants.length === 1
           ? "1 participant"
@@ -220,6 +229,9 @@ function InRoom({
             {participant.id === selfId ? (
               <span className="text-muted"> (you)</span>
             ) : null}
+            {participant.connected ? null : (
+              <span className="text-muted"> (reconnecting…)</span>
+            )}
           </li>
         ))}
       </ul>

@@ -63,6 +63,24 @@ describe("startClockSync", () => {
     expect(sync.estimateServerNowMs()).toBeNull();
   });
 
+  it("uses a seeded estimate from a previous connection until its own round completes", () => {
+    const previous = { roundTripMs: 40, monotonicToServerOffsetMs: 5000 };
+    const { sync, reply } = setup({ initialEstimate: previous });
+
+    // Before any pong, now is 0 on the monotonic clock: 0 + 5000.
+    expect(sync.estimateServerNowMs()).toBe(5000);
+    expect(sync.currentSample()).toEqual(previous);
+
+    reply(10, 1000); // sent 0, received 10: offset 1000 - 5 = 995
+    expect(sync.estimateServerNowMs()).toBe(5010);
+    reply(10, 1010);
+    reply(10, 1020);
+
+    // The new round's best sample replaces the seed.
+    expect(sync.currentSample()).toEqual({ roundTripMs: 10, monotonicToServerOffsetMs: 995 });
+    expect(sync.estimateServerNowMs()).toBe(30 + 995);
+  });
+
   it("uses the lowest round trip of the round", () => {
     const { sync, reply } = setup();
 

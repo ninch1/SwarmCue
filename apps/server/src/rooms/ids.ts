@@ -1,8 +1,9 @@
-import { randomInt, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomInt, randomUUID } from "node:crypto";
 import {
   ROOM_ID_ALPHABET,
   ROOM_ID_LENGTH,
   type ParticipantId,
+  type ResumeToken,
   type RoomId,
 } from "@swarmcue/protocol";
 
@@ -20,4 +21,14 @@ export function generateRoomId(): RoomId {
 
 export function generateParticipantId(): ParticipantId {
   return randomUUID();
+}
+
+/** 32 bytes (256 bits) from a CSPRNG, as 43 base64url characters. */
+export function generateResumeToken(): ResumeToken {
+  return randomBytes(32).toString("base64url");
+}
+
+/** Only this hash is kept in memory, never the token itself. */
+export function hashResumeToken(token: ResumeToken): string {
+  return createHash("sha256").update(token).digest("base64url");
 }
