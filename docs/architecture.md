@@ -206,6 +206,17 @@ The room's playback state is `{ status, positionSeconds, updatedAtServerMs, revi
 - **Drift correction (seek only).** While the room is playing, each client checks its position every second and seeks to the expected position when it is more than 0.5 s off. Checks are skipped while seeking or buffering, and corrective seeks have a 3 s cooldown. Expected server time comes from clock estimation; until the first estimate, a client uses its own clock.
 - **Local actions.** A user's play, pause, and seek are reported as commands; events caused by applying room state are ignored. A change counts as the user's only when it follows a recent user gesture (`navigator.userActivation.isActive`), because browsers also pause and resume media on their own (for example, Chrome pauses muted playback that started without a gesture when it is offscreen). Browser-initiated pauses stay local, and a browser-initiated resume while the room is paused is reverted. Reaching the end of the media always pauses the room. Pressing play while the room is already playing (for example after the browser blocked autoplay) rejoins the room's position instead of restarting it.
 
+### Personal subtitles
+
+A participant can add a local `.srt` or `.vtt` file to the video they are watching. It stays in their browser: nothing is sent to the server or other participants, and it never changes room playback.
+
+- **Validation.** The file extension decides the format (MIME types are unreliable for local subtitles). Files over 1 MiB are rejected before being read; typical feature-length subtitles are 50–250 KB. Text must be UTF-8, because browsers cannot reliably detect legacy encodings.
+- **Normalization.** A pure module converts SRT to WebVTT (optional cue numbers, comma or dot milliseconds, any hour count, multiline text; malformed blocks are skipped and counted) and keeps WebVTT as written apart from the BOM and line endings. Text starting with a `WEBVTT` header is treated as WebVTT whatever its extension. SRT `<i>`, `<b>`, `<u>` are kept; `<font>` and `{\an8}`-style overrides are dropped, so their colors and positions are not supported.
+- **Rendering.** The normalized WebVTT becomes a `Blob` object URL attached as a native `<track kind="subtitles">`, so the browser keeps cues on the media timeline through seeks, drift corrections, and resyncs, and shows them in native fullscreen. SwarmCue has its own compact control (add, show/hide, replace, remove); the browser's captions menu stays in step with it. Styling is limited to `::cue`, and OS caption preferences may override it.
+- **Lifecycle.** A subtitle belongs to what the player shows: a picked local file, or a stream identified by its torrent. It is removed (and its object URL revoked) when the room's media changes, the host picks another file, or the participant leaves or enters another room. A reconnect keeps it. Subtitles are not stored, so a refresh loses them.
+
+ASS/SSA files and shared (room-wide) subtitles are not part of this. Shared subtitles should reuse the normalized WebVTT and the same rendering path, travel in their own message rather than in room snapshots, and leave each participant free to show or hide them.
+
 ### Playback control (V1)
 
 - Any participant may play, pause, or seek. The server applies commands in arrival order, so the last command wins.
@@ -282,12 +293,14 @@ Vitest is the test runner. Specific remaining library choices (for example WebTo
 - Peer discovery depends on available WebTorrent-compatible trackers.
 - Browsers cannot connect to ordinary BitTorrent swarms (TCP/UDP peers, `udp://` trackers), so public torrents are not supported.
 - SwarmCue does not provide server-side transcoding or media fallback.
+- Personal subtitles are lost on refresh, must be UTF-8, and are cleared if a host who refreshed re-picks their file (the player switches from the stream to the local file).
 
 ## Out of Scope for V1
 
 - Arbitrary user-provided magnet links.
 - Public torrent swarms.
 - A media queue; a room has one current media item.
+- ASS/SSA subtitles; V1 subtitles are `.srt` and `.vtt`.
 - A desktop or native companion application that bridges conventional TCP/UDP BitTorrent swarms to browser WebRTC peers.
 - Acting as a general browser torrent client.
 

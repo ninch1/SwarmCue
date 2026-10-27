@@ -1,9 +1,18 @@
 import type { PlaybackState } from "@swarmcue/protocol";
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import {
   usePlaybackSync,
   type LocalPlaybackChange,
 } from "../player/usePlaybackSync.js";
+
+/** A WebVTT subtitle shown through the video's native text-track rendering. */
+export type VideoSubtitle = {
+  /** A new id means a new <track> element. */
+  id: number;
+  url: string;
+  label: string;
+  enabled: boolean;
+};
 
 type VideoPlayerProps = {
   src: string | null;
@@ -17,6 +26,10 @@ type VideoPlayerProps = {
   getServerNowMs: () => number;
   /** Called when this user plays, pauses, or seeks the video. */
   onLocalPlaybackChange: (change: LocalPlaybackChange) => void;
+  /** Local only: never affects the source or playback. */
+  subtitle?: VideoSubtitle | null;
+  /** The user switched the subtitle on or off from the browser's own captions menu. */
+  onSubtitleEnabledChange?: (enabled: boolean) => void;
   onError?: () => void;
 };
 
@@ -27,14 +40,56 @@ export function VideoPlayer({
   resyncKey,
   getServerNowMs,
   onLocalPlaybackChange,
+  subtitle = null,
+  onSubtitleEnabledChange,
   onError,
 }: VideoPlayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const trackRef = useRef<HTMLTrackElement | null>(null);
   const { blocked } = usePlaybackSync(videoRef, src, playback, {
     resyncKey,
     getServerNowMs,
     onLocalChange: onLocalPlaybackChange,
   });
+
+  const subtitleId = subtitle?.id ?? null;
+  const subtitleEnabled = subtitle?.enabled ?? false;
+  const subtitleEnabledRef = useRef(subtitleEnabled);
+  subtitleEnabledRef.current = subtitleEnabled;
+  const onSubtitleEnabledChangeRef = useRef(onSubtitleEnabledChange);
+  onSubtitleEnabledChangeRef.current = onSubtitleEnabledChange;
+
+  // A <track> starts disabled; set its mode on every new track or video
+  // element. "hidden" keeps the cues loaded, so switching back on is instant.
+  useEffect(() => {
+    const textTrack = trackRef.current?.track;
+    if (!textTrack) {
+      return;
+    }
+    const mode = subtitleEnabled ? "showing" : "hidden";
+    if (textTrack.mode !== mode) {
+      textTrack.mode = mode;
+    }
+  }, [src, subtitleId, subtitleEnabled]);
+
+  // Native controls have their own captions menu; keep our toggle in step with it.
+  useEffect(() => {
+    const textTracks = videoRef.current?.textTracks;
+    const trackElement = trackRef.current;
+    if (!textTracks || !trackElement?.track) {
+      return;
+    }
+    const handleChange = () => {
+      const showing = trackElement.track.mode === "showing";
+      if (showing !== subtitleEnabledRef.current) {
+        onSubtitleEnabledChangeRef.current?.(showing);
+      }
+    };
+    textTracks.addEventListener("change", handleChange);
+    return () => {
+      textTracks.removeEventListener("change", handleChange);
+    };
+  }, [src, subtitleId]);
 
   return (
     <div className="flex flex-col gap-2">
@@ -51,7 +106,18 @@ export function VideoPlayer({
             playsInline
             onError={onError}
             className="block h-full w-full bg-black"
-          />
+          >
+            {subtitle ? (
+              <track
+                key={subtitle.id}
+                ref={trackRef}
+                kind="subtitles"
+                src={subtitle.url}
+                label={subtitle.label}
+                srcLang="und"
+              />
+            ) : null}
+          </video>
         ) : (
           <div className="px-6 py-6 text-center text-muted">
             <p className="m-0">No media loaded</p>

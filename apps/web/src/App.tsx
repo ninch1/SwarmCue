@@ -10,6 +10,7 @@ import {
   SharingStatus,
   type SharingState,
 } from "./components/SharingStatus.js";
+import { SubtitleControl } from "./components/SubtitleControl.js";
 import { VideoPlayer } from "./components/VideoPlayer.js";
 import { infoHashOf, isSameTorrent } from "./media/infoHash.js";
 import { toMediaName } from "./media/mediaName.js";
@@ -19,6 +20,7 @@ import {
 } from "./media/sharedMediaMemory.js";
 import { browserSessionStorage } from "./room/sessionStore.js";
 import { useRoom } from "./room/useRoom.js";
+import { usePersonalSubtitles } from "./subtitles/usePersonalSubtitles.js";
 import {
   clearActiveTorrent,
   createMagnetFromFile,
@@ -268,6 +270,17 @@ export function App() {
   }
   const fileName = source.kind === "file" ? source.fileName : null;
 
+  // Personal subtitles belong to what the player shows. Each picked file is
+  // new media; a stream is identified by its torrent, so reconnecting keeps
+  // the subtitle while new room media, leaving, or another room drops it.
+  let subtitleMediaKey: string | null = null;
+  if (source.kind === "file") {
+    subtitleMediaKey = `file:${source.objectUrl}`;
+  } else if (source.kind === "magnet") {
+    subtitleMediaKey = `torrent:${infoHashOf(source.magnetUri) ?? source.magnetUri}`;
+  }
+  const subtitles = usePersonalSubtitles(subtitleMediaKey);
+
   // The host's media counts as shared only once a server snapshot carries it.
   const hostMagnetUri = magnetGeneration.magnetUri;
   // A local file that is not (yet) the room's media is a private preview: it
@@ -379,12 +392,36 @@ export function App() {
             console.error("Could not send playback command:", error);
           }
         }}
+        subtitle={
+          subtitles.subtitle
+            ? {
+                id: subtitles.subtitle.id,
+                url: subtitles.subtitle.url,
+                label: subtitles.subtitle.fileName,
+                enabled: subtitles.subtitle.enabled,
+              }
+            : null
+        }
+        onSubtitleEnabledChange={subtitles.setEnabled}
         onError={() => {
           setPlayerError(
             "The browser could not play this video. Its format or codec may be unsupported.",
           );
         }}
       />
+
+      {subtitleMediaKey !== null ? (
+        <SubtitleControl
+          fileName={subtitles.subtitle?.fileName ?? null}
+          enabled={subtitles.subtitle?.enabled ?? false}
+          skippedBlocks={subtitles.subtitle?.skippedBlocks ?? 0}
+          loading={subtitles.loading}
+          error={subtitles.error}
+          onFileSelected={subtitles.select}
+          onEnabledChange={subtitles.setEnabled}
+          onRemove={subtitles.remove}
+        />
+      ) : null}
 
       {playerError ? (
         <p className="m-0 text-sm text-danger" role="alert">
